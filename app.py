@@ -18,7 +18,7 @@ import concurrent.futures
 import csv
 import html
 from collections import Counter
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -38,6 +38,12 @@ _HERE = Path(__file__).parent
 _DATA_DIR = _HERE / "eNotice_data"
 _INDEX_PATH = _HERE / "units.csv"
 _RECIP_PATH = _HERE / "reciprocity_violations.csv"
+_LOGO_PATH = _HERE / "assets" / "ieee-logo.png"
+
+# Digest view shows at most this many recent eNotices, none older than this many
+# months before the sidebar end date.
+_DIGEST_MAX_TILES = 6
+_DIGEST_MAX_AGE_MONTHS = 1
 
 _SEARCH_MIN_CHARS = 3
 _SEARCH_LIMIT = 50
@@ -407,9 +413,132 @@ def matches_recipients(cell, selected):
 
 
 # --------------------------------------------------------------------------- #
-# UI
+# Digest view helpers
 
-st.title("📬 eNotice Digest")
+def _fmt_full_date(d):
+    """'Thursday, November 20, 2025' (no leading zero on the day)."""
+    return f"{d.strftime('%A, %B')} {d.day}, {d.year}"
+
+
+def _fmt_date(d):
+    """'November 20, 2025'."""
+    return f"{d.strftime('%B')} {d.day}, {d.year}"
+
+
+def _unit_name(spoid, unit_info):
+    ou = unit_info.get(resolve_spoid(spoid))
+    return ou.name if ou is not None and ou.name else spoid
+
+
+def _unit_link(spoid, unit_info):
+    """A unit name linked to its website, or plain text if no URL is known."""
+    name = html.escape(_unit_name(spoid, unit_info))
+    ou = unit_info.get(resolve_spoid(spoid))
+    url = (ou.url or "").strip() if ou is not None else ""
+    if url:
+        return f'<a href="{html.escape(url)}" target="_blank">{name}</a>'
+    return name
+
+
+def _join_units(spoids, unit_info):
+    """Comma-separated unit links with an 'and' before the last, name-sorted."""
+    ordered = sorted(set(spoids), key=lambda s: _unit_name(s, unit_info).lower())
+    links = [_unit_link(s, unit_info) for s in ordered]
+    if len(links) <= 1:
+        return "".join(links)
+    if len(links) == 2:
+        return " and ".join(links)
+    return ", ".join(links[:-1]) + ", and " + links[-1]
+
+
+def _go_archive():
+    st.session_state.view = "archive"
+
+
+def _go_digest():
+    st.session_state.view = "digest"
+
+
+@st.dialog("Digest settings")
+def _settings_dialog():
+    st.write("Digest settings can currently be adjusted in the sidebar. In the "
+             "future, this will be managed through your IEEE profile settings.")
+
+
+def render_digest_view(digest, selected_norm, unit_info, end_date):
+    """Render the tiled digest of the most recent eNotices."""
+    c_logo, c_title, c_link = st.columns([2, 6, 2],
+                                         vertical_alignment="center")
+    with c_logo:
+        if _LOGO_PATH.exists():
+            st.image(str(_LOGO_PATH), width=150)
+    with c_title:
+        st.markdown('<div class="digest-title">Your IEEE eNotice Digest</div>',
+                    unsafe_allow_html=True)
+    with c_link:
+        st.button("Digest Archive", key="to_archive", on_click=_go_archive)
+
+    date_txt = _fmt_full_date(end_date) if end_date is not None else ""
+    st.markdown('<hr class="digest-rule">'
+                f'<div class="digest-date">{date_txt}</div>',
+                unsafe_allow_html=True)
+
+    # Most-recent eNotices, none older than the max age before the end date.
+    tiles = digest
+    if end_date is not None:
+        cutoff = (pd.Timestamp(end_date)
+                  - pd.DateOffset(months=_DIGEST_MAX_AGE_MONTHS))
+        tiles = tiles[tiles["_sent_dt"] >= cutoff]
+    tiles = tiles.sort_values("_sent_dt", ascending=False).head(_DIGEST_MAX_TILES)
+
+    if tiles.empty:
+        window = (f" in the month before {_fmt_date(end_date)}"
+                  if end_date is not None else "")
+        st.info(f"No recent eNotices to display{window} for the selected "
+                "units. Widen the date range or adjust your selection in the "
+                "sidebar.")
+    else:
+        placeholder_summary = (
+            "Placeholder summary: a concise two- to three-sentence AI-generated "
+            "overview of this eNotice will appear here, highlighting its key "
+            "details and purpose. Final wording is pending integration.")
+        placeholder_tags = "".join(
+            f'<span class="digest-tag">#{t}</span>'
+            for t in ("PlaceholderOne", "PlaceholderTwo", "PlaceholderThree"))
+        blocks = []
+        for _, row in tiles.iterrows():
+            recips = (parse_recipient_spoids(row.get("recipient_SPOIDs", ""))
+                      & selected_norm)
+            units_html = _join_units(recips, unit_info) or "—"
+            sent = row["_sent_dt"]
+            sent_txt = _fmt_date(sent) if pd.notna(sent) else ""
+            subject = html.escape(str(row.get("mailing_subject", "") or ""))
+            public_url = ("https://enotice.vtools.ieee.org/public/"
+                          + str(row.get("id", "")))
+            blocks.append(
+                '<div class="digest-tile">'
+                '<div class="digest-thumb">🖼️</div>'
+                '<div class="digest-body">'
+                f'<div class="digest-units">{units_html}</div>'
+                f'<div class="digest-sent">{sent_txt}</div>'
+                f'<a class="digest-subject" href="{html.escape(public_url)}" '
+                f'target="_blank">{subject}</a>'
+                f'<div class="digest-summary">{placeholder_summary}</div>'
+                f'<div class="digest-tags">{placeholder_tags}</div>'
+                '</div></div>')
+        st.markdown("\n".join(blocks), unsafe_allow_html=True)
+
+    agg = _join_units(selected_norm, unit_info)
+    st.markdown(f'<div class="digest-agg">This digest aggregates content from '
+                f'{agg}.</div>', unsafe_allow_html=True)
+    if st.button("Manage your digest settings.", key="manage_settings"):
+        _settings_dialog()
+    st.markdown(f'<div class="digest-copyright">© {date.today().year} IEEE. '
+                'All rights reserved.</div>', unsafe_allow_html=True)
+
+
+# --------------------------------------------------------------------------- #
+# UI
 
 # On wide screens, widen the sidebar so the full data-file name shows in the
 # picker and the Section-search prompt fits on one line. Left at Streamlit's
@@ -437,6 +566,50 @@ st.markdown(
         text-overflow: clip !important;
         white-space: normal !important;
     }
+    /* --- Digest view --- */
+    .digest-title { font-size: 1.9rem; font-weight: 600; color: #1a1a1a;
+                    line-height: 1.1; }
+    .digest-rule { border: none; border-top: 2px solid #00629B;
+                   margin: -0.6rem 0 0.15rem !important; }
+    .digest-date { color: #555; font-size: 0.9rem; margin: 0; }
+    .digest-tile { display: flex; gap: 1rem; background: #ffffff;
+                   border: 1px solid #e4e4e4; border-radius: 6px; padding: 1rem;
+                   margin-bottom: 1rem;
+                   box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    .digest-thumb { flex: 0 0 130px; width: 130px; height: 130px;
+                    border-radius: 4px; display: flex; align-items: center;
+                    justify-content: center; font-size: 2.2rem; color: #9bb0c1;
+                    background: linear-gradient(135deg, #eef3f7, #d9e2ea); }
+    .digest-body { flex: 1; min-width: 0; }
+    .digest-units { font-size: 0.9rem; margin-bottom: 0.1rem; }
+    .digest-units a, .digest-subject, .digest-agg a { color: #00629B;
+                    text-decoration: none; }
+    .digest-units a:hover, .digest-subject:hover,
+    .digest-agg a:hover { text-decoration: underline; }
+    .digest-sent { color: #666; font-size: 0.85rem; margin-bottom: 0.35rem; }
+    .digest-subject { display: inline-block; font-size: 1.15rem;
+                      font-weight: 600; margin-bottom: 0.4rem; }
+    .digest-summary { color: #333; font-size: 0.95rem; line-height: 1.45;
+                      margin-bottom: 0.55rem; }
+    .digest-tag { display: inline-block; background: #eaf1f8; color: #00629B;
+                  font-size: 0.8rem; padding: 0.1rem 0.55rem; border-radius: 12px;
+                  margin: 0 0.35rem 0.25rem 0; }
+    .digest-agg { text-align: center; color: #444; margin-top: 1.2rem;
+                  font-size: 1rem; }
+    .digest-copyright { text-align: center; color: #777; font-size: 1rem;
+                        margin-top: 0.3rem; }
+    /* Buttons styled as inline text links (view switch + manage settings). */
+    .st-key-to_archive button, .st-key-to_digest button,
+    .st-key-manage_settings button {
+        color: #00629B !important; background: transparent !important;
+        border: none !important; box-shadow: none !important;
+        padding: 0 !important; min-height: 0 !important; font-weight: 400;
+    }
+    .st-key-to_archive button:hover, .st-key-to_digest button:hover,
+    .st-key-manage_settings button:hover { text-decoration: underline; }
+    .st-key-manage_settings { width: 100% !important; display: flex;
+        justify-content: center; }
+    .st-key-manage_settings button { font-size: 1rem !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -664,6 +837,19 @@ if start_date and end_date:
     mask &= (df["_sent_dt"] >= start_ts) & (df["_sent_dt"] < end_ts)
 
 digest = df[mask]
+
+# Resolve selected units to their OU (name + website) for both views.
+unit_info = {resolve_spoid(sp): ou for sp, ou in label_pool.items()}
+
+st.session_state.setdefault("view", "digest")
+if st.session_state.view == "digest":
+    render_digest_view(digest, selected_norm, unit_info, end_date)
+    st.stop()
+
+# --- Archive view ---
+_archive_cols = st.columns([8, 2])
+with _archive_cols[1]:
+    st.button("← Digest", key="to_digest", on_click=_go_digest)
 
 # Drop the excluded statistic columns, the status column, and hidden helpers.
 drop_cols = [c for c in _STAT_COLUMNS + _HIDDEN_COLUMNS if c in digest.columns]
