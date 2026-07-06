@@ -1,0 +1,4 @@
+streamlit>=1.39
+streamlit-searchbox>=0.1.20
+urllib3>=2.0
+pandas>=2.0

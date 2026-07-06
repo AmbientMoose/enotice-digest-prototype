@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.streamlit/secrets.toml
+*.egg-info/
+.DS_Store
+
+# Local-only harness / preview artifacts
+.claude/
+
+# Deferred: to be added to the repo later
+taxonomy/
+
+# Private: real submitter-name mapping; must never be committed
+private/
