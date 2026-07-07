@@ -16,7 +16,10 @@ Run locally:  streamlit run app.py
 
 import concurrent.futures
 import csv
+import hmac
 import html
+import os
+import re
 from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
@@ -45,6 +48,11 @@ _LOGO_PATH = _HERE / "assets" / "ieee-logo.png"
 _DIGEST_MAX_TILES = 6
 _DIGEST_MAX_AGE_MONTHS = 1
 
+# AI summary agent (Anthropic). A light model keeps per-digest cost down.
+_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+_SUMMARY_MAX_TOKENS = 220
+_FETCH_TIMEOUT = 20  # seconds, per source page fetch
+
 _SEARCH_MIN_CHARS = 3
 _SEARCH_LIMIT = 50
 
@@ -63,6 +71,54 @@ _MAX_WORKERS = 8
 _HTTP = urllib3.PoolManager(maxsize=_MAX_WORKERS)
 
 st.set_page_config(page_title="eNotice Digest", page_icon="📬", layout="wide")
+
+
+# --------------------------------------------------------------------------- #
+# Access gate (modeled on the IEEE Section Operations Assistant)
+
+def _load_secrets_into_env():
+    """Copy API keys from Streamlit secrets into the environment so the Anthropic
+    SDK (which reads os.getenv) works on Streamlit Cloud. No-op if no secrets."""
+    try:
+        secrets = st.secrets
+    except Exception:
+        return
+    for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        if key in secrets and not os.getenv(key):
+            os.environ[key] = str(secrets[key])
+
+
+def check_password():
+    """Gate the app behind a shared password in st.secrets['app_password'] (or
+    the APP_PASSWORD env var). If none is configured, the app is open."""
+    configured = ""
+    try:
+        if hasattr(st, "secrets"):
+            configured = str(st.secrets.get("app_password", ""))
+    except Exception:
+        configured = ""
+    if not configured:
+        configured = os.getenv("APP_PASSWORD", "")
+    if not configured:
+        return  # open deployment
+    if st.session_state.get("auth_ok"):
+        return
+
+    def _check():
+        ok = hmac.compare_digest(st.session_state.get("pw", ""), configured)
+        st.session_state["auth_ok"] = ok
+        if ok:
+            st.session_state.pop("pw", None)
+
+    st.text_input("Enter access password", type="password", key="pw",
+                  on_change=_check)
+    if st.session_state.get("auth_ok") is False:
+        st.error("Incorrect password. Ask Chris for the access password.")
+    st.stop()
+
+
+_load_secrets_into_env()
+check_password()
 
 
 # --------------------------------------------------------------------------- #
@@ -413,7 +469,97 @@ def matches_recipients(cell, selected):
 
 
 # --------------------------------------------------------------------------- #
+# AI summary agent (Anthropic; modeled on the IEEE Section Operations Assistant)
+
+_SUMMARY_SYSTEM = (
+    "You summarize IEEE eNotices for a member digest. Given the text of an "
+    "eNotice (the primary source) and optionally a related event page (a "
+    "secondary source), write a neutral, factual 2-3 sentence summary of what "
+    "the notice is about and its most important details -- the event or action, "
+    "any key dates or deadlines, and what the reader is asked to do. Base the "
+    "summary only on the provided content; do not invent details. No marketing "
+    "language, greeting, or closing. Output only the summary sentences."
+)
+
+
+def _fetch_text(url):
+    """Fetch a URL and return its visible text (scripts/markup stripped, capped).
+
+    Returns '' on any error or non-200, so a failed fetch degrades gracefully.
+    """
+    url = (url or "").strip()
+    if not url:
+        return ""
+    try:
+        resp = _HTTP.request("GET", url, timeout=_FETCH_TIMEOUT)
+    except Exception:
+        return ""
+    if resp.status != 200 or not resp.data:
+        return ""
+    doc = resp.data.decode("utf-8", errors="replace")
+    doc = re.sub(r"(?is)<script.*?</script>", " ", doc)
+    doc = re.sub(r"(?is)<style.*?</style>", " ", doc)
+    text = html.unescape(re.sub(r"(?s)<[^>]+>", " ", doc))
+    return re.sub(r"\s+", " ", text).strip()[:6000]
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def enotice_summary(public_url, event_url):
+    """A 2-3 sentence AI summary of an eNotice from its public page (primary)
+    and event page (secondary). Returns None when unavailable (no key, fetch or
+    LLM failure) so the caller can fall back to placeholder text.
+
+    Cached per (public_url, event_url) so each notice is summarized once.
+    """
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        return None
+    primary = _fetch_text(public_url)
+    if not primary:
+        return None
+    content = f"eNotice page ({public_url}):\n{primary}"
+    secondary = _fetch_text(event_url) if event_url else ""
+    if secondary:
+        content += f"\n\nRelated event page ({event_url}):\n{secondary}"
+    try:
+        import anthropic
+        client = anthropic.Anthropic()
+        msg = client.messages.create(
+            model=_ANTHROPIC_MODEL,
+            max_tokens=_SUMMARY_MAX_TOKENS,
+            system=_SUMMARY_SYSTEM,
+            messages=[{"role": "user", "content": content}],
+        )
+        text = "".join(b.text for b in msg.content
+                       if getattr(b, "type", "") == "text").strip()
+        return text or None
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # Digest view helpers
+
+_URL_RE = re.compile(r"https?://[^\s<]+")
+# Trailing sentence punctuation / stray HTML entities to keep OUT of a link
+# (but not &amp;, which is a real URL query separator).
+_URL_TRAIL_RE = re.compile(r"(&(?:quot|gt|lt|#x27|#39);|[.,;:!?)\]}])$")
+
+
+def _linkify(text):
+    """HTML-escape text, then turn bare http(s) URLs into clickable links."""
+    def repl(m):
+        url, trail = m.group(0), ""
+        while True:
+            t = _URL_TRAIL_RE.search(url)
+            if not t:
+                break
+            trail = t.group(0) + trail
+            url = url[:-len(t.group(0))]
+        if not url:
+            return m.group(0)
+        return f'<a href="{url}" target="_blank">{url}</a>{trail}'
+    return _URL_RE.sub(repl, html.escape(text))
+
 
 def _fmt_full_date(d):
     """'Thursday, November 20, 2025' (no leading zero on the day)."""
@@ -505,16 +651,27 @@ def render_digest_view(digest, selected_norm, unit_info, end_date):
         placeholder_tags = "".join(
             f'<span class="digest-tag">#{t}</span>'
             for t in ("PlaceholderOne", "PlaceholderTwo", "PlaceholderThree"))
+        rows = [row for _, row in tiles.iterrows()]
+        urls = [("https://enotice.vtools.ieee.org/public/" + str(r.get("id", "")),
+                 str(r.get("event_url", "") or "")) for r in rows]
+
+        # AI summaries for the displayed notices, fetched/generated in parallel
+        # and cached per notice so reruns don't re-spend credits.
+        with st.spinner("Summarizing recent eNotices..."):
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=_MAX_WORKERS) as pool:
+                summaries = list(pool.map(
+                    lambda pe: enotice_summary(pe[0], pe[1]), urls))
+
         blocks = []
-        for _, row in tiles.iterrows():
+        for row, (public_url, _ev), summary in zip(rows, urls, summaries):
             recips = (parse_recipient_spoids(row.get("recipient_SPOIDs", ""))
                       & selected_norm)
             units_html = _join_units(recips, unit_info) or "—"
             sent = row["_sent_dt"]
             sent_txt = _fmt_date(sent) if pd.notna(sent) else ""
             subject = html.escape(str(row.get("mailing_subject", "") or ""))
-            public_url = ("https://enotice.vtools.ieee.org/public/"
-                          + str(row.get("id", "")))
+            summary_html = _linkify(summary or placeholder_summary)
             blocks.append(
                 '<div class="digest-tile">'
                 '<div class="digest-thumb">🖼️</div>'
@@ -523,7 +680,7 @@ def render_digest_view(digest, selected_norm, unit_info, end_date):
                 f'<div class="digest-sent">{sent_txt}</div>'
                 f'<a class="digest-subject" href="{html.escape(public_url)}" '
                 f'target="_blank">{subject}</a>'
-                f'<div class="digest-summary">{placeholder_summary}</div>'
+                f'<div class="digest-summary">{summary_html}</div>'
                 f'<div class="digest-tags">{placeholder_tags}</div>'
                 '</div></div>')
         st.markdown("\n".join(blocks), unsafe_allow_html=True)
@@ -582,10 +739,10 @@ st.markdown(
                     background: linear-gradient(135deg, #eef3f7, #d9e2ea); }
     .digest-body { flex: 1; min-width: 0; }
     .digest-units { font-size: 0.9rem; margin-bottom: 0.1rem; }
-    .digest-units a, .digest-subject, .digest-agg a { color: #00629B;
-                    text-decoration: none; }
+    .digest-units a, .digest-subject, .digest-agg a,
+    .digest-summary a { color: #00629B; text-decoration: none; }
     .digest-units a:hover, .digest-subject:hover,
-    .digest-agg a:hover { text-decoration: underline; }
+    .digest-agg a:hover, .digest-summary a:hover { text-decoration: underline; }
     .digest-sent { color: #666; font-size: 0.85rem; margin-bottom: 0.35rem; }
     .digest-subject { display: inline-block; font-size: 1.15rem;
                       font-weight: 600; margin-bottom: 0.4rem; }
