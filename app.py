@@ -23,6 +23,7 @@ import re
 from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
+from urllib.parse import urljoin
 
 import pandas as pd
 import streamlit as st
@@ -52,6 +53,21 @@ _DIGEST_MAX_AGE_MONTHS = 1
 _ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 _SUMMARY_MAX_TOKENS = 220
 _FETCH_TIMEOUT = 20  # seconds, per source page fetch
+
+# Tile image: OpenAI generation (fallback when no suitable page image exists).
+_IMAGE_MODEL = "gpt-image-1"
+_IMAGE_SIZE = "1024x1024"
+_IMAGE_QUALITY = "low"
+
+# Substrings that mark an <img> as chrome (logos, banners, icons, maps) rather
+# than an eNotice's own content picture.
+_CHROME_IMG = (
+    "ieee-logo", "logo_ieee_vtools", "vtools/logo", "favicon",
+    "enotice_header", "enotice_footer", "fb_logo", "twitter", "facebook",
+    "ieee_logo_share", "add_to_calendar", "ical_icon", "google_cal",
+    "staticmap", "maps.googleapis", "content/dam/ieee-org",
+    "meeting_registration_link_image", "/assets/",
+)
 
 _SEARCH_MIN_CHARS = 3
 _SEARCH_LIMIT = 50
@@ -482,11 +498,9 @@ _SUMMARY_SYSTEM = (
 )
 
 
-def _fetch_text(url):
-    """Fetch a URL and return its visible text (scripts/markup stripped, capped).
-
-    Returns '' on any error or non-200, so a failed fetch degrades gracefully.
-    """
+@st.cache_data(show_spinner=False, ttl=86400)
+def _fetch_raw(url):
+    """Fetch a URL and return its raw HTML, cached. '' on error/non-200."""
     url = (url or "").strip()
     if not url:
         return ""
@@ -496,7 +510,12 @@ def _fetch_text(url):
         return ""
     if resp.status != 200 or not resp.data:
         return ""
-    doc = resp.data.decode("utf-8", errors="replace")
+    return resp.data.decode("utf-8", errors="replace")
+
+
+def _fetch_text(url):
+    """Visible text of a page (scripts/markup stripped, capped)."""
+    doc = _fetch_raw(url)
     doc = re.sub(r"(?is)<script.*?</script>", " ", doc)
     doc = re.sub(r"(?is)<style.*?</style>", " ", doc)
     text = html.unescape(re.sub(r"(?s)<[^>]+>", " ", doc))
@@ -534,6 +553,120 @@ def enotice_summary(public_url, event_url):
         return text or None
     except Exception:
         return None
+
+
+# --------------------------------------------------------------------------- #
+# Tile image agent: use a suitable picture from the page, else generate one
+
+def _content_image_candidates(html_doc, base_url):
+    """Absolute URLs of an eNotice/event page's content images (chrome removed).
+
+    Uploaded content images (…/vtools_ui/media/display/…) are preferred first.
+    """
+    out, seen = [], set()
+    for src in re.findall(r'<img[^>]+src=["\']([^"\']+)', html_doc, re.I):
+        absu = urljoin(base_url, src)
+        low = absu.lower()
+        if any(p in low for p in _CHROME_IMG) or absu in seen:
+            continue
+        seen.add(absu)
+        out.append(absu)
+    out.sort(key=lambda u: 0 if "media/display" in u.lower() else 1)
+    return out
+
+
+def _image_is_suitable(img_url, subject):
+    """Ask the Claude agent (vision) whether an image is a relevant content
+    picture (not a logo/banner/icon/map). Returns False on any error."""
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        return False
+    try:
+        import anthropic
+        client = anthropic.Anthropic()
+        msg = client.messages.create(
+            model=_ANTHROPIC_MODEL,
+            max_tokens=5,
+            system=("You choose a thumbnail for an IEEE eNotice. Decide whether "
+                    "the given image is a suitable content picture -- a relevant "
+                    "photo, event flyer, or topical graphic -- and NOT a logo, "
+                    "generic banner or email template, icon, map, QR code, "
+                    "social button, or purely decorative element. Answer with "
+                    "only YES or NO."),
+            messages=[{"role": "user", "content": [
+                {"type": "image",
+                 "source": {"type": "url", "url": img_url}},
+                {"type": "text",
+                 "text": f"eNotice subject: {subject}\nIs this a suitable "
+                         "content picture? Answer YES or NO."},
+            ]}],
+        )
+        ans = "".join(b.text for b in msg.content
+                      if getattr(b, "type", "") == "text").strip().upper()
+        return ans.startswith("Y")
+    except Exception:
+        return False
+
+
+def _generate_image(subject, context):
+    """Generate a realistic thumbnail with OpenAI when no page image fits.
+
+    The Claude agent writes the prompt; OpenAI renders it. Returns a data-URI or
+    None (no OpenAI key, or any failure)."""
+    if not os.getenv("OPENAI_API_KEY"):
+        return None
+    prompt = None
+    if os.getenv("ANTHROPIC_API_KEY"):
+        try:
+            import anthropic
+            client = anthropic.Anthropic()
+            msg = client.messages.create(
+                model=_ANTHROPIC_MODEL,
+                max_tokens=120,
+                system=("Write ONE concise image-generation prompt (a single "
+                        "sentence) for a realistic, professional thumbnail that "
+                        "visually represents this IEEE eNotice's topic or event. "
+                        "No text, words, letters, logos, watermarks, or "
+                        "identifiable real people. Output only the prompt."),
+                messages=[{"role": "user",
+                           "content": f"Subject: {subject}\n\n{context}"}],
+            )
+            prompt = "".join(b.text for b in msg.content
+                             if getattr(b, "type", "") == "text").strip()
+        except Exception:
+            prompt = None
+    if not prompt:
+        prompt = (f"A realistic, professional photo representing the topic of an "
+                  f"IEEE event titled '{subject}'. No text or logos.")
+    try:
+        from openai import OpenAI
+        client = OpenAI()
+        resp = client.images.generate(
+            model=_IMAGE_MODEL, prompt=prompt,
+            size=_IMAGE_SIZE, quality=_IMAGE_QUALITY, n=1)
+        b64 = resp.data[0].b64_json
+        return f"data:image/png;base64,{b64}" if b64 else None
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def enotice_image(public_url, event_url, subject):
+    """An image src for a digest tile, or None.
+
+    Prefers a suitable content picture on the public page, then the event page
+    (both confirmed by the vision agent); otherwise generates one. Cached per
+    notice so pages aren't re-scanned and images aren't re-generated on rerun.
+    """
+    for src in (public_url, event_url):
+        if not src:
+            continue
+        raw = _fetch_raw(src)
+        if not raw:
+            continue
+        for cand in _content_image_candidates(raw, src)[:2]:
+            if _image_is_suitable(cand, subject):
+                return cand
+    return _generate_image(subject, _fetch_text(public_url)[:1500])
 
 
 # --------------------------------------------------------------------------- #
@@ -652,29 +785,36 @@ def render_digest_view(digest, selected_norm, unit_info, end_date):
             f'<span class="digest-tag">#{t}</span>'
             for t in ("PlaceholderOne", "PlaceholderTwo", "PlaceholderThree"))
         rows = [row for _, row in tiles.iterrows()]
-        urls = [("https://enotice.vtools.ieee.org/public/" + str(r.get("id", "")),
-                 str(r.get("event_url", "") or "")) for r in rows]
+        metas = [("https://enotice.vtools.ieee.org/public/" + str(r.get("id", "")),
+                  str(r.get("event_url", "") or ""),
+                  str(r.get("mailing_subject", "") or "")) for r in rows]
 
-        # AI summaries for the displayed notices, fetched/generated in parallel
-        # and cached per notice so reruns don't re-spend credits.
-        with st.spinner("Summarizing recent eNotices..."):
+        # Summaries and tile images for the displayed notices, fetched/generated
+        # in parallel and cached per notice so reruns don't re-spend credits.
+        with st.spinner("Preparing recent eNotices..."):
             with concurrent.futures.ThreadPoolExecutor(
                     max_workers=_MAX_WORKERS) as pool:
                 summaries = list(pool.map(
-                    lambda pe: enotice_summary(pe[0], pe[1]), urls))
+                    lambda m: enotice_summary(m[0], m[1]), metas))
+                images = list(pool.map(
+                    lambda m: enotice_image(m[0], m[1], m[2]), metas))
 
         blocks = []
-        for row, (public_url, _ev), summary in zip(rows, urls, summaries):
+        for row, (public_url, _ev, subj), summary, img in zip(
+                rows, metas, summaries, images):
             recips = (parse_recipient_spoids(row.get("recipient_SPOIDs", ""))
                       & selected_norm)
             units_html = _join_units(recips, unit_info) or "—"
             sent = row["_sent_dt"]
             sent_txt = _fmt_date(sent) if pd.notna(sent) else ""
-            subject = html.escape(str(row.get("mailing_subject", "") or ""))
+            subject = html.escape(subj)
             summary_html = _linkify(summary or placeholder_summary)
+            thumb = (f'<div class="digest-thumb"><img src="{html.escape(img)}" '
+                     f'alt=""></div>' if img
+                     else '<div class="digest-thumb">🖼️</div>')
             blocks.append(
                 '<div class="digest-tile">'
-                '<div class="digest-thumb">🖼️</div>'
+                f'{thumb}'
                 '<div class="digest-body">'
                 f'<div class="digest-units">{units_html}</div>'
                 f'<div class="digest-sent">{sent_txt}</div>'
@@ -736,7 +876,10 @@ st.markdown(
     .digest-thumb { flex: 0 0 130px; width: 130px; height: 130px;
                     border-radius: 4px; display: flex; align-items: center;
                     justify-content: center; font-size: 2.2rem; color: #9bb0c1;
+                    overflow: hidden;
                     background: linear-gradient(135deg, #eef3f7, #d9e2ea); }
+    .digest-thumb img { width: 100%; height: 100%; object-fit: cover;
+                        display: block; }
     .digest-body { flex: 1; min-width: 0; }
     .digest-units { font-size: 0.9rem; margin-bottom: 0.1rem; }
     .digest-units a, .digest-subject, .digest-agg a,
