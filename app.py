@@ -18,6 +18,7 @@ import concurrent.futures
 import csv
 import hmac
 import html
+import json
 import os
 import re
 from collections import Counter
@@ -43,6 +44,8 @@ _DATA_DIR = _HERE / "eNotice_data"
 _INDEX_PATH = _HERE / "units.csv"
 _RECIP_PATH = _HERE / "reciprocity_violations.csv"
 _LOGO_PATH = _HERE / "assets" / "ieee-logo.png"
+_TAG_CATEGORIES_PATH = _HERE / "tag_categories.csv"
+_TAXONOMY_PATH = _HERE / "taxonomy" / "ieee_taxonomy.csv"
 
 # Digest view shows at most this many recent eNotices, none older than this many
 # months before the sidebar end date.
@@ -52,7 +55,24 @@ _DIGEST_MAX_AGE_MONTHS = 1
 # AI summary agent (Anthropic). A light model keeps per-digest cost down.
 _ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 _SUMMARY_MAX_TOKENS = 220
+_TAG_MAX_TOKENS = 320
 _FETCH_TIMEOUT = 20  # seconds, per source page fetch
+
+# AI tag agent: at most this many *generated* tags per eNotice. Event tags
+# (rule 4) and taxonomy ancestors (rule 5) are added on top and do not count
+# against this limit.
+_DIGEST_MAX_TAGS = 6
+
+# Rule 5 (IEEE Taxonomy): at most this many taxonomy terms count toward the tag
+# limit (lean toward one higher-level term covering multiple topics). A term at
+# this taxonomy depth or deeper is treated as "lower-level" and is only used
+# when named verbatim in the content; otherwise a broader ancestor is used.
+_TAXONOMY_MAX_TAGS = 2
+_TAX_DEEP_LEVEL = 2
+
+# vTools Events API: structured event data (tags, category, location, content)
+# by event id. Preferred over scraping the event_url HTML page.
+_EVENTS_API = "https://events.vtools.ieee.org/api/public/v5/events/list?id={}"
 
 # Tile image: OpenAI generation (fallback when no suitable page image exists).
 _IMAGE_MODEL = "gpt-image-1"
@@ -513,22 +533,119 @@ def _fetch_raw(url):
     return resp.data.decode("utf-8", errors="replace")
 
 
-def _fetch_text(url):
-    """Visible text of a page (scripts/markup stripped, capped)."""
-    doc = _fetch_raw(url)
+def _strip_html(doc, cap=6000):
+    """Visible text of an HTML fragment (scripts/markup stripped, capped)."""
+    doc = doc or ""
     doc = re.sub(r"(?is)<script.*?</script>", " ", doc)
     doc = re.sub(r"(?is)<style.*?</style>", " ", doc)
     text = html.unescape(re.sub(r"(?s)<[^>]+>", " ", doc))
-    return re.sub(r"\s+", " ", text).strip()[:6000]
+    return re.sub(r"\s+", " ", text).strip()[:cap]
+
+
+def _fetch_text(url):
+    """Visible text of a page (scripts/markup stripped, capped)."""
+    return _strip_html(_fetch_raw(url))
+
+
+def _event_id_from_url(event_url):
+    """The numeric event id embedded in a vTools event URL (…/m/<id>), or ''."""
+    m = re.search(r"/m/(\d+)", str(event_url or ""))
+    return m.group(1) if m else ""
 
 
 @st.cache_data(show_spinner=False, ttl=86400)
-def enotice_summary(public_url, event_url):
-    """A 2-3 sentence AI summary of an eNotice from its public page (primary)
-    and event page (secondary). Returns None when unavailable (no key, fetch or
-    LLM failure) so the caller can fall back to placeholder text.
+def event_api(event_id):
+    """Structured event data from the vTools Events API, keyed by event id.
 
-    Cached per (public_url, event_url) so each notice is summarized once.
+    Returns a normalized dict (empty on any failure) with the fields the digest
+    needs: title, text (description + agenda, markup stripped), tags, category,
+    city/state/country, location_type, and image URL. Preferred over scraping
+    the event_url HTML page. Cached per id so each event is fetched once.
+    """
+    event_id = str(event_id or "").strip()
+    if not event_id:
+        return {}
+    raw = _fetch_raw(_EVENTS_API.format(event_id))
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+        rec = (payload.get("data") or [None])[0]
+        if not rec:
+            return {}
+        a = rec.get("attributes", {}) or {}
+        included = payload.get("included", []) or []
+    except Exception:
+        return {}
+
+    # Resolve related records (category name, state/country names) from the
+    # JSON:API "included" list.
+    by_ref = {(i.get("type"), str(i.get("id"))): (i.get("attributes") or {})
+              for i in included}
+
+    rels = rec.get("relationships", {}) or {}
+
+    def _related(rel, *name_keys):
+        data = ((rels.get(rel) or {}).get("data")) or None
+        if not data:
+            return ""
+        attrs = by_ref.get((data.get("type"), str(data.get("id"))), {})
+        for k in name_keys:
+            if attrs.get(k):
+                return str(attrs[k])
+        return ""
+
+    tags = a.get("tags")
+    if not isinstance(tags, list):
+        tags = str(a.get("keywords") or "").split()
+
+    text = " ".join(t for t in (_strip_html(a.get("description") or "", 4000),
+                                _strip_html(a.get("agenda") or "", 1000)) if t)
+
+    return {
+        "title": str(a.get("title") or "").strip(),
+        "text": text,
+        "tags": [str(t) for t in tags if str(t).strip()],
+        "category": _related("category", "name"),
+        "city": str(a.get("city") or "").strip(),
+        "state": _related("state", "name"),
+        "country": _related("country", "name"),
+        "location_type": str(a.get("location-type") or "").strip().lower(),
+        "image": str(a.get("image") or "").strip(),
+    }
+
+
+def _event_content_block(ev):
+    """A compact text block describing an event, for the summary/tag agents."""
+    if not ev:
+        return ""
+    parts = []
+    if ev.get("title"):
+        parts.append(f"Event title: {ev['title']}")
+    loc_bits = [b for b in (ev.get("city"), ev.get("state"), ev.get("country"))
+                if b]
+    if ev.get("location_type"):
+        loc = ev["location_type"]
+        if loc_bits:
+            loc += " -- " + ", ".join(loc_bits)
+        parts.append(f"Location: {loc}")
+    if ev.get("category"):
+        parts.append(f"Event category: {ev['category']}")
+    if ev.get("tags"):
+        parts.append("Event tags: " + " ".join(ev["tags"]))
+    if ev.get("text"):
+        parts.append(f"Event details: {ev['text']}")
+    return "\n".join(parts)
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def enotice_summary(public_url, event_id):
+    """A 2-3 sentence AI summary of an eNotice from its public page (primary)
+    and its event's structured API record (secondary). Returns None when
+    unavailable (no key, fetch or LLM failure) so the caller can fall back to
+    placeholder text.
+
+    Cached per (public_url, event_id) so each notice is summarized once.
     """
     if not os.getenv("ANTHROPIC_API_KEY"):
         return None
@@ -536,9 +653,9 @@ def enotice_summary(public_url, event_url):
     if not primary:
         return None
     content = f"eNotice page ({public_url}):\n{primary}"
-    secondary = _fetch_text(event_url) if event_url else ""
+    secondary = _event_content_block(event_api(event_id)) if event_id else ""
     if secondary:
-        content += f"\n\nRelated event page ({event_url}):\n{secondary}"
+        content += f"\n\nRelated event:\n{secondary}"
     try:
         import anthropic
         client = anthropic.Anthropic()
@@ -553,6 +670,355 @@ def enotice_summary(public_url, event_url):
         return text or None
     except Exception:
         return None
+
+
+# --------------------------------------------------------------------------- #
+# AI tag agent: topical hashtags for an eNotice tile (rules 1-6)
+
+_TAG_SYSTEM = (
+    "You analyze an IEEE eNotice shown in a member digest to help tag it. You "
+    "are given the eNotice's subject line, its short summary, and (when present) "
+    "the associated event's own tags. Respond with a single JSON object and "
+    "nothing else, with exactly these keys:\n"
+    '- "category": the ONE best-matching category from the allowed list below, '
+    "copied verbatim, if one clearly applies -- otherwise null.\n"
+    '- "relevant_event_tags": an array (empty if none, never null) containing '
+    "the subset of the event's own tags listed in the content that are closely "
+    "related to the eNotice's subject matter, copied verbatim. Exclude organizer "
+    "or person names, host/section/chapter codes, and anything not about the "
+    "topic. If there is no related event, use an empty array.\n"
+    '- "geography": the single most specific place the notice is tied to (for '
+    'example just the city of an in-person event, as "Santiago"), or null if it '
+    "is not tied to a physical place (for example an online-only notice).\n"
+    '- "technical_topics": an array of the specific technical, engineering, or '
+    'scientific subject areas the notice is about (for example "machine '
+    'learning", "electric vehicles", "power systems"), or an empty array if the '
+    "notice is not technical.\n"
+    '- "conference_short": if the notice is about a specific conference or '
+    "symposium that has a short name or acronym, that short name -- excluding "
+    'any location/city suffix but keeping a year if present (for example '
+    '"ISIE2026" from "ISIE2026-Nagoya"); otherwise null.\n'
+    '- "conference_long": if the notice is about a specific conference or '
+    "symposium but only a full name is available, that full name with any "
+    'leading "IEEE" and any leading ordinal such as "35th" removed (for example '
+    '"International Symposium on Industrial Electronics"); otherwise null.\n'
+    "Base everything only on the provided content; do not invent details."
+)
+
+
+def _camel_tag(text):
+    """Normalize a phrase to a camel-case tag body (no leading '#').
+
+    Splits on any run of non-alphanumerics, upper-cases each token's first
+    letter while preserving all-caps acronyms, and joins with no separators:
+    'greenhouse-gas' -> 'GreenhouseGas', 'STEM' -> 'STEM', 'Aerospace control'
+    -> 'AerospaceControl'. Returns '' when nothing usable remains.
+    """
+    tokens = re.findall(r"[0-9A-Za-z]+", str(text or ""))
+    return "".join(t if t.isupper() else t[:1].upper() + t[1:] for t in tokens)
+
+
+def _dedup_ci(items):
+    """De-duplicate tag bodies case-insensitively, preserving first-seen order."""
+    out, seen = [], set()
+    for it in items:
+        k = it.lower()
+        if it and k not in seen:
+            seen.add(k)
+            out.append(it)
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def load_tag_categories():
+    """The controlled list of eNotice categories (rule 3), from CSV. A missing
+    file yields [] (rule 3 simply never fires)."""
+    try:
+        with open(_TAG_CATEGORIES_PATH, newline="", encoding="utf-8") as fh:
+            return [c.strip() for r in csv.DictReader(fh)
+                    if (c := (r.get("category") or "").strip())]
+    except OSError:
+        return []
+
+
+@st.cache_data(show_spinner=False)
+def load_taxonomy():
+    """IEEE taxonomy terms for rule 5, as a list of (term_lower, path_terms)
+    sorted longest-term-first so the most specific match wins. path_terms is the
+    term's full_path (root..leaf) of display terms. Empty if the file is
+    absent."""
+    try:
+        with open(_TAXONOMY_PATH, newline="", encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+    except OSError:
+        return []
+    out, seen = [], set()
+    for r in rows:
+        term = (r.get("term") or "").strip()
+        if not term or term.lower() in seen:
+            continue
+        seen.add(term.lower())
+        segs = [s.strip() for s in (r.get("full_path") or "").split(">")
+                if s.strip()] or [term]
+        out.append((term.lower(), segs))
+    out.sort(key=lambda ts: len(ts[0]), reverse=True)
+    return out
+
+
+def _match_taxonomy(topics_text, content_text, limit=_TAXONOMY_MAX_TAGS):
+    """Match IEEE taxonomy terms for an eNotice's technical topics (rule 5),
+    leaning toward higher-level terms.
+
+    Lexically finds taxonomy terms in `topics_text` (the model's technical
+    topics), then for each taxonomy family it (a) consolidates two or more
+    matches into their deepest shared ancestor -- one higher-level term that
+    covers them -- and (b) generalizes any lower-level term (taxonomy depth
+    >= `_TAX_DEEP_LEVEL`) that is not named verbatim in `content_text` up to a
+    broader ancestor. Returns (leaf_terms, ancestor_terms): up to `limit`
+    representative terms that count toward the tag limit, plus the broader terms
+    on their paths (exempt)."""
+    topics_low = f" {topics_text.lower()} "
+    content_low = f" {content_text.lower()} "
+
+    # 1. Lexical hits, longest-first, dropping terms contained in a longer match.
+    hits = []  # (term_lower, segs)
+    for term_lower, segs in load_taxonomy():
+        if len(term_lower) < 4:
+            continue
+        if any(term_lower in k for k, _ in hits):
+            continue
+        if re.search(r"\b" + re.escape(term_lower) + r"\b", topics_low):
+            hits.append((term_lower, segs))
+            if len(hits) >= 12:
+                break
+    if not hits:
+        return [], []
+
+    def _mentioned(term):
+        return bool(re.search(r"\b" + re.escape(term.lower()) + r"\b", content_low))
+
+    def _generalize(segs):
+        # Climb toward the root while the term is lower-level and unmentioned.
+        segs = list(segs)
+        while len(segs) - 1 >= _TAX_DEEP_LEVEL and not _mentioned(segs[-1]):
+            segs = segs[:-1]
+        return segs
+
+    # 2. One representative term per taxonomy family.
+    families = {}  # family term -> list of segs
+    for _, segs in hits:
+        families.setdefault(segs[0], []).append(segs)
+
+    reps = []  # (rep_segs, group_size, most_specific_match_len)
+    for group in families.values():
+        if len(group) >= 2:
+            prefix = group[0]  # deepest common ancestor = longest common prefix
+            for segs in group[1:]:
+                n = 0
+                while n < len(prefix) and n < len(segs) and prefix[n] == segs[n]:
+                    n += 1
+                prefix = prefix[:n]
+            rep = _generalize(prefix)
+        else:
+            rep = _generalize(group[0])
+        reps.append((rep, len(group), max(len(s[-1]) for s in group)))
+
+    # 3. Prefer families with more matches (then more specific), then cap.
+    reps.sort(key=lambda r: (r[1], r[2]), reverse=True)
+    leaves, ancestors = [], []
+    for rep_segs, _, _ in reps[:limit]:
+        if not rep_segs:
+            continue
+        if rep_segs[-1] not in leaves:
+            leaves.append(rep_segs[-1])
+            ancestors.extend(a for a in rep_segs[:-1] if a not in ancestors)
+    ancestors = [a for a in ancestors if a not in leaves]
+    return leaves, ancestors
+
+
+def _tag_llm(content, categories):
+    """Ask the Claude agent for a category, relevant event tags, geography,
+    technical topics, and conference name(s) as a JSON object. {} on error."""
+    try:
+        import anthropic
+        client = anthropic.Anthropic()
+        allowed = ", ".join(categories) if categories else "(none provided)"
+        msg = client.messages.create(
+            model=_ANTHROPIC_MODEL,
+            max_tokens=_TAG_MAX_TOKENS,
+            system=_TAG_SYSTEM + "\n\nAllowed categories: " + allowed,
+            messages=[{"role": "user", "content": content}],
+        )
+        raw = "".join(b.text for b in msg.content
+                      if getattr(b, "type", "") == "text")
+        m = re.search(r"\{.*\}", raw, re.S)
+        return json.loads(m.group(0)) if m else {}
+    except Exception:
+        return {}
+
+
+# Provenance descriptions shown when hovering a tag. Each explains whether the
+# tag was AI-generated (and by which rule) or imported from the associated event.
+_TAG_SRC_CATEGORY = "AI-generated: matched eNotice category (rule 3)"
+_TAG_SRC_EVENT = "Imported from the associated event's tags (rule 4)"
+_TAG_SRC_TAXONOMY = "AI-generated: matched IEEE Taxonomy term (rule 5)"
+_TAG_SRC_TAXONOMY_ANCESTOR = ("AI-generated: broader IEEE Taxonomy category of a "
+                              "matched term (rule 5)")
+_TAG_SRC_GEO_AI = "AI-generated: location associated with the eNotice (rule 6)"
+_TAG_SRC_GEO_EVENT = "From the associated event's location (rule 6)"
+_TAG_SRC_CONFERENCE = "AI-generated: conference or symposium name (rule 7)"
+
+
+def _conference_tag(short, long):
+    """A tag body for a conference/symposium the eNotice is about (rule 7).
+
+    Prefers a short name/acronym, dropping a trailing location suffix but keeping
+    a year (``ISIE2026-Nagoya`` -> ``ISIE2026``). Otherwise shortens the long
+    name by stripping a leading ``IEEE`` and an ordinal such as ``35th``
+    (``IEEE 35th International Symposium on Industrial Electronics`` ->
+    ``InternationalSymposiumOnIndustrialElectronics``). '' if neither applies.
+    """
+    short = (short or "").strip()
+    if short:
+        # Drop a trailing location word (a separator + purely alphabetic token);
+        # a year stays because it contains digits.
+        short = re.sub(r"[-–\s]+[A-Za-z]+$", "", short).strip()
+        return _camel_tag(short)
+    long = (long or "").strip()
+    if not long:
+        return ""
+    prev = None
+    while prev != long:  # strip a leading "IEEE" and/or ordinal, in any order
+        prev = long
+        long = re.sub(r"^\s*IEEE\b\.?\s*", "", long, flags=re.I)
+        long = re.sub(r"^\s*\d+\s*(?:st|nd|rd|th)\b\.?\s*", "", long, flags=re.I)
+    return _camel_tag(long)
+
+
+def _dedup_tags(pairs):
+    """De-duplicate (tag_body, source) pairs case-insensitively, treating an
+    ``IEEE``-prefixed variant as a duplicate of the bare tag and keeping the
+    shorter body (rule 7: ``IEEESoutheastCon2025`` / ``SoutheastCon2025`` ->
+    ``SoutheastCon2025``). Exact duplicates keep the first (highest-priority)
+    occurrence and its source."""
+    out, pos = [], {}  # out: [body, source]; pos: dedup key -> index in out
+    for body, source in pairs:
+        if not body:
+            continue
+        low = body.lower()
+        key = re.sub(r"^ieee", "", low) or low
+        if key in pos:
+            i = pos[key]
+            if len(body) < len(out[i][0]):  # prefer the shorter variant
+                out[i] = [body, source]
+            continue
+        pos[key] = len(out)
+        out.append([body, source])
+    return [(b, s) for b, s in out]
+
+
+def _filter_event_tags(event_tags, relevant):
+    """Keep only the event's own tags the model judged closely related to the
+    content (rule 1's relevance requirement applied to rule 4). `relevant` is the
+    model's verbatim subset; None (field absent / parse failure) keeps all tags
+    as a fallback, while a provided list keeps the intersection -- matched by
+    normalized form so the original tag text is preserved."""
+    if not event_tags:
+        return []
+    if relevant is None:
+        return list(event_tags)
+    keep = {_camel_tag(t).lower() for t in relevant if str(t).strip()}
+    return [t for t in event_tags if _camel_tag(t).lower() in keep]
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def enotice_tags(subject, summary, event_id):
+    """Topical tags for an eNotice tile, or None to fall back to placeholders.
+
+    Tags are generated from what the reader actually sees -- the eNotice
+    `subject`, its 2-3 sentence `summary`, and the associated event's own tags --
+    rather than the full page text, so they track the summary and subject.
+
+    Returns a list of (tag_body, provenance) pairs, where provenance explains on
+    hover whether the tag was AI-generated (and by which rule) or imported from
+    the associated event. Every tag comes from one of rules 3-7 and must be
+    closely related to the content (rule 1): the matched category (rule 3), the
+    event's own relevant tags (rule 4), IEEE taxonomy terms + ancestors (rule 5),
+    a geography (rule 6), and a conference/symposium name (rule 7). Category,
+    taxonomy leaves, geography, and the conference name count toward
+    `_DIGEST_MAX_TAGS`; event tags and taxonomy ancestors do not.
+
+    Cached per (subject, summary, event_id) so each notice is tagged once.
+    """
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        return None
+    subject = (subject or "").strip()
+    summary = (summary or "").strip()
+    ev = event_api(event_id) if event_id else {}
+    if not subject and not summary and not ev:
+        return None
+
+    categories = load_tag_categories()
+    parts = []
+    if subject:
+        parts.append(f"eNotice subject: {subject}")
+    if summary:
+        parts.append(f"eNotice summary: {summary}")
+    if ev.get("tags"):
+        parts.append("Associated event's own tags: " + " ".join(ev["tags"]))
+    data = _tag_llm("\n\n".join(parts), categories)
+
+    # Every tag must satisfy one of rules 3-7 (rule 1). Counted tags (category,
+    # conference, geography, taxonomy leaves) fill up to the six-tag cap.
+    counted = []  # (body, source)
+
+    cat = (data.get("category") or "").strip()
+    if cat and any(cat.lower() == c.lower() for c in categories):
+        counted.append((_camel_tag(cat), _TAG_SRC_CATEGORY))
+
+    conf = _conference_tag(data.get("conference_short"),
+                           data.get("conference_long"))
+    if conf:
+        counted.append((conf, _TAG_SRC_CONFERENCE))
+
+    geo = ""
+    geo_source = _TAG_SRC_GEO_AI
+    if ev.get("location_type") in ("physical", "hybrid"):
+        geo = ev.get("city") or ev.get("state") or ev.get("country") or ""
+        if geo:
+            geo_source = _TAG_SRC_GEO_EVENT
+    geo = geo or (data.get("geography") or "").strip()
+    geo = geo.split(",")[0].strip()  # keep the most specific part (the city)
+    if geo:
+        counted.append((_camel_tag(geo), geo_source))
+
+    # Rule 5: match taxonomy terms against the model's technical topics (anchored
+    # there rather than free text to avoid matching generic words). If the model
+    # found no topics but the event is categorized Technical, fall back to the
+    # subject. The "mentioned in content" check uses only the subject, summary,
+    # and event tags.
+    topics = [str(t) for t in (data.get("technical_topics") or []) if str(t)]
+    scan = " ".join(topics)
+    if not scan and ev.get("category", "").lower() == "technical":
+        scan = subject
+    ancestors = []
+    if scan:
+        content_text = " ".join(x for x in (subject, summary,
+                                            " ".join(ev.get("tags", []))) if x)
+        leaves, ancestors = _match_taxonomy(scan, content_text)
+        counted.extend((_camel_tag(t), _TAG_SRC_TAXONOMY) for t in leaves)
+
+    counted = [(b, s) for b, s in counted if b]
+    counted = _dedup_tags(counted)[:_DIGEST_MAX_TAGS]
+
+    # Exempt tags: the event's own relevant tags (rule 4) and taxonomy ancestors
+    # (rule 5).
+    relevant = _filter_event_tags(ev.get("tags", []),
+                                  data.get("relevant_event_tags"))
+    exempt = [(_camel_tag(t), _TAG_SRC_EVENT) for t in relevant]
+    exempt += [(_camel_tag(t), _TAG_SRC_TAXONOMY_ANCESTOR) for t in ancestors]
+
+    return _dedup_tags(counted + [(b, s) for b, s in exempt if b]) or None
 
 
 # --------------------------------------------------------------------------- #
@@ -650,22 +1116,22 @@ def _generate_image(subject, context):
 
 
 @st.cache_data(show_spinner=False, ttl=86400)
-def enotice_image(public_url, event_url, subject):
+def enotice_image(public_url, event_id, subject):
     """An image src for a digest tile, or None.
 
-    Prefers a suitable content picture on the public page, then the event page
-    (both confirmed by the vision agent); otherwise generates one. Cached per
-    notice so pages aren't re-scanned and images aren't re-generated on rerun.
+    Prefers a suitable content picture from the public page's images, then the
+    event's own image from the Events API (both confirmed by the vision agent);
+    otherwise generates one. Cached per notice so pages aren't re-scanned and
+    images aren't re-generated on rerun.
     """
-    for src in (public_url, event_url):
-        if not src:
-            continue
-        raw = _fetch_raw(src)
-        if not raw:
-            continue
-        for cand in _content_image_candidates(raw, src)[:2]:
+    raw = _fetch_raw(public_url)
+    if raw:
+        for cand in _content_image_candidates(raw, public_url)[:2]:
             if _image_is_suitable(cand, subject):
                 return cand
+    ev = event_api(event_id) if event_id else {}
+    if ev.get("image") and _image_is_suitable(ev["image"], subject):
+        return ev["image"]
     return _generate_image(subject, _fetch_text(public_url)[:1500])
 
 
@@ -782,32 +1248,48 @@ def render_digest_view(digest, selected_norm, unit_info, end_date):
             "overview of this eNotice will appear here, highlighting its key "
             "details and purpose. Final wording is pending integration.")
         placeholder_tags = "".join(
-            f'<span class="digest-tag">#{t}</span>'
+            f'<span class="digest-tag" title="Placeholder tag (AI tag '
+            f'generation unavailable)">#{t}</span>'
             for t in ("PlaceholderOne", "PlaceholderTwo", "PlaceholderThree"))
         rows = [row for _, row in tiles.iterrows()]
-        metas = [("https://enotice.vtools.ieee.org/public/" + str(r.get("id", "")),
-                  str(r.get("event_url", "") or ""),
-                  str(r.get("mailing_subject", "") or "")) for r in rows]
+        metas = []
+        for r in rows:
+            event_url = str(r.get("event_url", "") or "")
+            event_id = (str(r.get("event_id", "") or "").strip()
+                        or _event_id_from_url(event_url))
+            metas.append(
+                ("https://enotice.vtools.ieee.org/public/" + str(r.get("id", "")),
+                 event_id,
+                 str(r.get("mailing_subject", "") or "")))
 
-        # Summaries and tile images for the displayed notices, fetched/generated
-        # in parallel and cached per notice so reruns don't re-spend credits.
-        # The wait is a prototype artifact: in production this content would be
-        # created once, when each eNotice is published, so the digest would load
-        # instantly. Here we generate it on demand and report per-notice progress.
+        # Summaries, tile images, and tags for the displayed notices,
+        # fetched/generated in parallel and cached per notice so reruns don't
+        # re-spend credits. The wait is a prototype artifact: in production this
+        # content would be created once, when each eNotice is published, so the
+        # digest would load instantly. Here we generate it on demand and report
+        # per-notice progress.
         n_tiles = len(metas)
+        scope_note = (
+            f"This prototype shows up to {_DIGEST_MAX_TILES} of the most recent "
+            "eNotices sent to your selected units on or before the end date set "
+            "in the sidebar, from the selected data file.")
         note = st.empty()
         note.caption(
-            "This short wait is specific to the prototype: eNotice summaries and "
-            "images are being generated on demand as you open the digest. In a "
-            "production system this content would be created once, when each "
-            "eNotice is published, so your digest would load instantly.")
+            "This short wait is specific to the prototype: eNotice summaries, "
+            "images, and tags are being generated on demand as you open the "
+            "digest. In a production system this content would be created once, "
+            "when each eNotice is published, so your digest would load instantly. "
+            + scope_note)
         progress = st.progress(0.0, text=f"Preparing eNotice 1 of {n_tiles}...")
 
         results = [None] * n_tiles
 
         def _prepare(m):
-            return (enotice_summary(m[0], m[1]),
-                    enotice_image(m[0], m[1], m[2]))
+            public_url, event_id, subj = m
+            summary = enotice_summary(public_url, event_id)
+            return (summary,
+                    enotice_image(public_url, event_id, subj),
+                    enotice_tags(subj, summary, event_id))
 
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=_MAX_WORKERS) as pool:
@@ -822,12 +1304,13 @@ def render_digest_view(digest, selected_norm, unit_info, end_date):
 
         summaries = [r[0] for r in results]
         images = [r[1] for r in results]
+        tags_list = [r[2] for r in results]
         progress.empty()
         note.empty()
 
         blocks = []
-        for row, (public_url, _ev, subj), summary, img in zip(
-                rows, metas, summaries, images):
+        for row, (public_url, _eid, subj), summary, img, tags in zip(
+                rows, metas, summaries, images, tags_list):
             recips = (parse_recipient_spoids(row.get("recipient_SPOIDs", ""))
                       & selected_norm)
             units_html = _join_units(recips, unit_info) or "—"
@@ -835,6 +1318,10 @@ def render_digest_view(digest, selected_norm, unit_info, end_date):
             sent_txt = _fmt_date(sent) if pd.notna(sent) else ""
             subject = html.escape(subj)
             summary_html = _linkify(summary or placeholder_summary)
+            tags_html = ("".join(
+                f'<span class="digest-tag" title="{html.escape(src)}">'
+                f'#{html.escape(body)}</span>' for body, src in tags)
+                if tags else placeholder_tags)
             thumb = (f'<div class="digest-thumb"><img src="{html.escape(img)}" '
                      f'alt=""></div>' if img
                      else '<div class="digest-thumb">🖼️</div>')
@@ -847,9 +1334,11 @@ def render_digest_view(digest, selected_norm, unit_info, end_date):
                 f'<a class="digest-subject" href="{html.escape(public_url)}" '
                 f'target="_blank">{subject}</a>'
                 f'<div class="digest-summary">{summary_html}</div>'
-                f'<div class="digest-tags">{placeholder_tags}</div>'
+                f'<div class="digest-tags">{tags_html}</div>'
                 '</div></div>')
         st.markdown("\n".join(blocks), unsafe_allow_html=True)
+        st.markdown(f'<div class="digest-scope">{html.escape(scope_note)}</div>',
+                    unsafe_allow_html=True)
 
     agg = _join_units(selected_norm, unit_info)
     st.markdown(f'<div class="digest-agg">This digest aggregates content from '
@@ -919,7 +1408,9 @@ st.markdown(
                       margin-bottom: 0.55rem; }
     .digest-tag { display: inline-block; background: #eaf1f8; color: #00629B;
                   font-size: 0.8rem; padding: 0.1rem 0.55rem; border-radius: 12px;
-                  margin: 0 0.35rem 0.25rem 0; }
+                  margin: 0 0.35rem 0.25rem 0; cursor: help; }
+    .digest-scope { text-align: center; color: #777; margin-top: 1rem;
+                    font-size: 0.85rem; font-style: italic; }
     .digest-agg { text-align: center; color: #444; margin-top: 1.2rem;
                   font-size: 1rem; }
     .digest-copyright { text-align: center; color: #777; font-size: 1rem;

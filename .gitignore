@@ -10,8 +10,9 @@ env/
 # Local-only harness / preview artifacts
 .claude/
 
-# Deferred: to be added to the repo later
-taxonomy/
+# Taxonomy: the CSV is committed (used for AI tag generation); the source PDF
+# is not needed by the app.
+taxonomy/*.pdf
 
 # Private: real submitter-name mapping; must never be committed
 private/
