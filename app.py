@@ -791,13 +791,39 @@ def render_digest_view(digest, selected_norm, unit_info, end_date):
 
         # Summaries and tile images for the displayed notices, fetched/generated
         # in parallel and cached per notice so reruns don't re-spend credits.
-        with st.spinner("Preparing recent eNotices..."):
-            with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=_MAX_WORKERS) as pool:
-                summaries = list(pool.map(
-                    lambda m: enotice_summary(m[0], m[1]), metas))
-                images = list(pool.map(
-                    lambda m: enotice_image(m[0], m[1], m[2]), metas))
+        # The wait is a prototype artifact: in production this content would be
+        # created once, when each eNotice is published, so the digest would load
+        # instantly. Here we generate it on demand and report per-notice progress.
+        n_tiles = len(metas)
+        note = st.empty()
+        note.caption(
+            "This short wait is specific to the prototype: eNotice summaries and "
+            "images are being generated on demand as you open the digest. In a "
+            "production system this content would be created once, when each "
+            "eNotice is published, so your digest would load instantly.")
+        progress = st.progress(0.0, text=f"Preparing eNotice 1 of {n_tiles}...")
+
+        results = [None] * n_tiles
+
+        def _prepare(m):
+            return (enotice_summary(m[0], m[1]),
+                    enotice_image(m[0], m[1], m[2]))
+
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=_MAX_WORKERS) as pool:
+            futures = {pool.submit(_prepare, m): i for i, m in enumerate(metas)}
+            done = 0
+            for fut in concurrent.futures.as_completed(futures):
+                results[futures[fut]] = fut.result()
+                done += 1
+                progress.progress(
+                    done / n_tiles,
+                    text=f"Preparing eNotice {done} of {n_tiles}...")
+
+        summaries = [r[0] for r in results]
+        images = [r[1] for r in results]
+        progress.empty()
+        note.empty()
 
         blocks = []
         for row, (public_url, _ev, subj), summary, img in zip(
