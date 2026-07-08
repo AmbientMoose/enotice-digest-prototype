@@ -14,8 +14,9 @@ sortable **archive** table.
 
 ## Two views
 
-**Digest view** (default) — an IEEE‑branded page showing up to six of the most
-recent eNotices (none older than one month before the selected end date). Each
+**Digest view** (default) — an IEEE‑branded page showing the eNotices for the
+selected units within the sidebar date range, newest first, six per page (page
+through the rest with the Newer/Older controls). Each
 tile has:
 
 - a picture — pulled from the notice's public page (or the event's image from
@@ -195,8 +196,8 @@ GitHub.
 
 A few constants near the top of `app.py` tune behavior:
 
-- `_DIGEST_MAX_TILES` (6) and `_DIGEST_MAX_AGE_MONTHS` (1) — how many recent
-  notices the digest shows and how far back.
+- `_DIGEST_MAX_TILES` (6) — how many eNotice tiles the digest shows per page
+  (newest first); the user pages through the rest with the Newer/Older controls.
 - `_DIGEST_MAX_TAGS` (6) — the maximum number of *generated* tags per tile (event
   tags and taxonomy ancestors are added on top and don't count against it).
 - `_ANTHROPIC_MODEL` — the model used for summaries, tags, the vision suitability

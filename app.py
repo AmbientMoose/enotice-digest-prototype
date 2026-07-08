@@ -47,10 +47,9 @@ _LOGO_PATH = _HERE / "assets" / "ieee-logo.png"
 _TAG_CATEGORIES_PATH = _HERE / "tag_categories.csv"
 _TAXONOMY_PATH = _HERE / "taxonomy" / "ieee_taxonomy.csv"
 
-# Digest view shows at most this many recent eNotices, none older than this many
-# months before the sidebar end date.
+# Digest view shows this many eNotice tiles per page (newest first); the user
+# pages through the rest with the Newer/Older controls.
 _DIGEST_MAX_TILES = 6
-_DIGEST_MAX_AGE_MONTHS = 1
 
 # AI summary agent (Anthropic). A light model keeps per-digest cost down.
 _ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
@@ -1204,6 +1203,15 @@ def _go_digest():
     st.session_state.view = "digest"
 
 
+def _digest_prev():
+    st.session_state["digest_page"] = max(
+        0, st.session_state.get("digest_page", 0) - 1)
+
+
+def _digest_next():
+    st.session_state["digest_page"] = st.session_state.get("digest_page", 0) + 1
+
+
 @st.dialog("Digest settings")
 def _settings_dialog():
     st.write("Digest settings can currently be adjusted in the sidebar. In the "
@@ -1228,20 +1236,26 @@ def render_digest_view(digest, selected_norm, unit_info, end_date):
                 f'<div class="digest-date">{date_txt}</div>',
                 unsafe_allow_html=True)
 
-    # Most-recent eNotices, none older than the max age before the end date.
-    tiles = digest
-    if end_date is not None:
-        cutoff = (pd.Timestamp(end_date)
-                  - pd.DateOffset(months=_DIGEST_MAX_AGE_MONTHS))
-        tiles = tiles[tiles["_sent_dt"] >= cutoff]
-    tiles = tiles.sort_values("_sent_dt", ascending=False).head(_DIGEST_MAX_TILES)
+    # All eNotices to the selected units within the sidebar date range, newest
+    # first, shown a page (`_DIGEST_MAX_TILES`) at a time.
+    all_tiles = digest.sort_values("_sent_dt", ascending=False)
+    total = len(all_tiles)
+
+    # Reset to the first (top) page whenever the result set changes.
+    sig = (end_date, tuple(all_tiles["id"].astype(str)))
+    if st.session_state.get("digest_page_sig") != sig:
+        st.session_state["digest_page_sig"] = sig
+        st.session_state["digest_page"] = 0
+    max_page = max(0, (total - 1) // _DIGEST_MAX_TILES)
+    page = min(max(st.session_state.get("digest_page", 0), 0), max_page)
+    st.session_state["digest_page"] = page
+    start = page * _DIGEST_MAX_TILES
+    tiles = all_tiles.iloc[start:start + _DIGEST_MAX_TILES]
 
     if tiles.empty:
-        window = (f" in the month before {_fmt_date(end_date)}"
-                  if end_date is not None else "")
-        st.info(f"No recent eNotices to display{window} for the selected "
-                "units. Widen the date range or adjust your selection in the "
-                "sidebar.")
+        st.info("No eNotices to display for the selected units within the "
+                "sidebar date range. Widen the date range or adjust your "
+                "selection in the sidebar.")
     else:
         placeholder_summary = (
             "Placeholder summary: a concise two- to three-sentence AI-generated "
@@ -1270,16 +1284,17 @@ def render_digest_view(digest, selected_norm, unit_info, end_date):
         # per-notice progress.
         n_tiles = len(metas)
         scope_note = (
-            f"This prototype shows up to {_DIGEST_MAX_TILES} of the most recent "
-            "eNotices sent to your selected units on or before the end date set "
-            "in the sidebar, from the selected data file.")
+            f"This prototype shows the eNotices sent to your selected units "
+            "within the date range set in the sidebar, from the selected data "
+            f"file -- most recent first, {_DIGEST_MAX_TILES} at a time. Use the "
+            "Newer/Older controls to move through them.")
         note = st.empty()
         note.caption(
             "This short wait is specific to the prototype: eNotice summaries, "
             "images, and tags are being generated on demand as you open the "
             "digest. In a production system this content would be created once, "
-            "when each eNotice is published, so your digest would load instantly. "
-            + scope_note)
+            "when each eNotice is published, so your digest would load instantly."
+            "\n\n" + scope_note)
         progress = st.progress(0.0, text=f"Preparing eNotice 1 of {n_tiles}...")
 
         results = [None] * n_tiles
@@ -1315,7 +1330,7 @@ def render_digest_view(digest, selected_norm, unit_info, end_date):
                       & selected_norm)
             units_html = _join_units(recips, unit_info) or "—"
             sent = row["_sent_dt"]
-            sent_txt = _fmt_date(sent) if pd.notna(sent) else ""
+            sent_txt = f"Sent {_fmt_date(sent)}" if pd.notna(sent) else ""
             subject = html.escape(subj)
             summary_html = _linkify(summary or placeholder_summary)
             tags_html = ("".join(
@@ -1337,6 +1352,27 @@ def render_digest_view(digest, selected_norm, unit_info, end_date):
                 f'<div class="digest-tags">{tags_html}</div>'
                 '</div></div>')
         st.markdown("\n".join(blocks), unsafe_allow_html=True)
+
+        # Pager: Newer (unless on the top page) / Older (unless on the last),
+        # with a position indicator. Only shown when there is more than one page.
+        if total > _DIGEST_MAX_TILES:
+            lo, hi = start + 1, start + len(tiles)
+            nav_l, nav_c, nav_r = st.columns([2, 4, 2],
+                                             vertical_alignment="center")
+            with nav_l:
+                if page > 0:
+                    st.button("‹ Newer", key="digest_prev",
+                              on_click=_digest_prev)
+            with nav_c:
+                st.markdown(
+                    f'<div class="digest-page">Showing eNotices {lo}–{hi} '
+                    f'of {total} (most recent first)</div>',
+                    unsafe_allow_html=True)
+            with nav_r:
+                if page < max_page:
+                    st.button("Older ›", key="digest_next",
+                              on_click=_digest_next)
+
         st.markdown(f'<div class="digest-scope">{html.escape(scope_note)}</div>',
                     unsafe_allow_html=True)
 
@@ -1409,6 +1445,7 @@ st.markdown(
     .digest-tag { display: inline-block; background: #eaf1f8; color: #00629B;
                   font-size: 0.8rem; padding: 0.1rem 0.55rem; border-radius: 12px;
                   margin: 0 0.35rem 0.25rem 0; cursor: help; }
+    .digest-page { text-align: center; color: #444; font-size: 0.9rem; }
     .digest-scope { text-align: center; color: #777; margin-top: 1rem;
                     font-size: 0.85rem; font-style: italic; }
     .digest-agg { text-align: center; color: #444; margin-top: 1.2rem;
