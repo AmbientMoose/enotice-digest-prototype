@@ -21,6 +21,7 @@ import html
 import json
 import os
 import re
+import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
@@ -72,6 +73,8 @@ _TAX_DEEP_LEVEL = 2
 # vTools Events API: structured event data (tags, category, location, content)
 # by event id. Preferred over scraping the event_url HTML page.
 _EVENTS_API = "https://events.vtools.ieee.org/api/public/v5/events/list?id={}"
+# Public eNotice atom feed: recent eNotices for a unit (used by digest search).
+_ENOTICE_FEED = "https://enotice.vtools.ieee.org/public/feed.atom?org_unit={}"
 
 # Tile image: OpenAI generation (fallback when no suitable page image exists).
 _IMAGE_MODEL = "gpt-image-1"
@@ -550,6 +553,48 @@ def _event_id_from_url(event_url):
     """The numeric event id embedded in a vTools event URL (…/m/<id>), or ''."""
     m = re.search(r"/m/(\d+)", str(event_url or ""))
     return m.group(1) if m else ""
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def enotice_feed(spoid):
+    """Recent eNotices for a unit, from the public atom feed.
+
+    Returns a list of dicts: {id, public_url, title, published (Timestamp|NaT),
+    text}. `text` is the title plus the body (markup stripped) for searching.
+    Empty on any failure. Cached per unit.
+    """
+    spoid = (spoid or "").strip()
+    if not spoid:
+        return []
+    try:
+        resp = _HTTP.request("GET", _ENOTICE_FEED.format(spoid),
+                             timeout=_FETCH_TIMEOUT)
+        if resp.status != 200 or not resp.data:
+            return []
+        root = ET.fromstring(resp.data)  # bytes -> honors XML encoding decl
+    except Exception:
+        return []
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    out = []
+    for e in root.findall("a:entry", ns):
+        title = (e.findtext("a:title", namespaces=ns) or "").strip()
+        link = ""
+        for lk in e.findall("a:link", ns):
+            if lk.get("href") and lk.get("rel") in (None, "alternate"):
+                link = lk.get("href")
+                break
+        m = (re.search(r"/(\d+)/?$", link)
+             or re.search(r"Mailing/(\d+)",
+                          e.findtext("a:id", namespaces=ns) or ""))
+        eid = m.group(1) if m else ""
+        body = _strip_html((e.findtext("a:content", namespaces=ns) or "") + " "
+                           + (e.findtext("a:summary", namespaces=ns) or ""))
+        published = pd.to_datetime(
+            e.findtext("a:published", namespaces=ns) or "", errors="coerce",
+            utc=True)
+        out.append({"id": eid, "public_url": link, "title": title,
+                    "published": published, "text": f"{title} {body}"})
+    return out
 
 
 @st.cache_data(show_spinner=False, ttl=86400)
@@ -1218,8 +1263,167 @@ def _settings_dialog():
              "future, this will be managed through your IEEE profile settings.")
 
 
+_SEARCH_HELP = (
+    "**How search works in this prototype**\n\n"
+    "Search scans the text of your selected units' **recent eNotices** -- "
+    "fetched live from the public IEEE eNotice feed -- and shows the ones that "
+    "contain all of your terms. Because summaries, images, and tags are "
+    "generated on demand here, search matches the eNotice **content**, and it "
+    "covers the recent notices the feed returns (independent of the data file "
+    "and date range set in the sidebar).\n\n"
+    "**In production**, every eNotice in your digest would already have a "
+    "summary and tags, so search would filter your digest **instantly** by "
+    "matching those **tags and summaries** across your full set of notices.")
+
+
+def _csv_records(digest, selected_norm):
+    """Tile records (newest first) for the CSV-based digest."""
+    recs = []
+    for _, r in digest.sort_values("_sent_dt", ascending=False).iterrows():
+        event_id = (str(r.get("event_id", "") or "").strip()
+                    or _event_id_from_url(str(r.get("event_url", "") or "")))
+        recs.append({
+            "public_url": ("https://enotice.vtools.ieee.org/public/"
+                           + str(r.get("id", ""))),
+            "event_id": event_id,
+            "subject": str(r.get("mailing_subject", "") or ""),
+            "sent_dt": r["_sent_dt"],
+            "recips": (parse_recipient_spoids(r.get("recipient_SPOIDs", ""))
+                       & selected_norm),
+        })
+    return recs
+
+
+def _search_records(query, selected_norm):
+    """Tile records from the live eNotice feeds of the selected units, matching
+    every whitespace-separated term (case-insensitive) in the title + body."""
+    terms = [t for t in query.lower().split() if t]
+    if not terms:
+        return []
+    spoids = sorted(selected_norm)
+    by_id = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        for sp, entries in zip(spoids, pool.map(enotice_feed, spoids)):
+            for e in entries:
+                key = e["id"] or e["public_url"]
+                if not key:
+                    continue
+                by_id.setdefault(key, {**e, "recips": set()})["recips"].add(sp)
+    matched = [r for r in by_id.values()
+               if all(t in r["text"].lower() for t in terms)]
+    matched.sort(
+        key=lambda r: r["published"].value if pd.notna(r["published"]) else -1,
+        reverse=True)
+    return [{"public_url": r["public_url"], "event_id": "",
+             "subject": r["title"], "sent_dt": r["published"],
+             "recips": r["recips"]} for r in matched]
+
+
+def _render_tile_page(records, unit_info, scope_note, empty_msg):
+    """Paginate `records`, generate each tile's summary/image/tags, and render."""
+    total = len(records)
+    sig = tuple(r["public_url"] for r in records)
+    if st.session_state.get("digest_page_sig") != sig:
+        st.session_state["digest_page_sig"] = sig
+        st.session_state["digest_page"] = 0
+    max_page = max(0, (total - 1) // _DIGEST_MAX_TILES)
+    page = min(max(st.session_state.get("digest_page", 0), 0), max_page)
+    st.session_state["digest_page"] = page
+    start = page * _DIGEST_MAX_TILES
+    tiles = records[start:start + _DIGEST_MAX_TILES]
+
+    if not tiles:
+        st.info(empty_msg)
+        return
+
+    placeholder_summary = (
+        "Placeholder summary: a concise two- to three-sentence AI-generated "
+        "overview of this eNotice will appear here, highlighting its key "
+        "details and purpose. Final wording is pending integration.")
+    placeholder_tags = "".join(
+        f'<span class="digest-tag" title="Placeholder tag (AI tag '
+        f'generation unavailable)">#{t}</span>'
+        for t in ("PlaceholderOne", "PlaceholderTwo", "PlaceholderThree"))
+
+    # Summaries, images, and tags are generated on demand and cached per notice
+    # (a prototype artifact -- in production they'd exist when each eNotice is
+    # published, so the digest would load instantly). Report per-notice progress.
+    n_tiles = len(tiles)
+    note = st.empty()
+    note.caption(
+        "This short wait is specific to the prototype: eNotice summaries, "
+        "images, and tags are being generated on demand as you open the "
+        "digest. In a production system this content would be created once, "
+        "when each eNotice is published, so your digest would load instantly."
+        "\n\n" + scope_note)
+    progress = st.progress(0.0, text=f"Preparing eNotice 1 of {n_tiles}...")
+
+    def _prepare(rec):
+        summary = enotice_summary(rec["public_url"], rec["event_id"])
+        return (summary,
+                enotice_image(rec["public_url"], rec["event_id"], rec["subject"]),
+                enotice_tags(rec["subject"], summary, rec["event_id"]))
+
+    results = [None] * n_tiles
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        futures = {pool.submit(_prepare, rec): i for i, rec in enumerate(tiles)}
+        done = 0
+        for fut in concurrent.futures.as_completed(futures):
+            results[futures[fut]] = fut.result()
+            done += 1
+            progress.progress(done / n_tiles,
+                              text=f"Preparing eNotice {done} of {n_tiles}...")
+    progress.empty()
+    note.empty()
+
+    blocks = []
+    for rec, (summary, img, tags) in zip(tiles, results):
+        units_html = _join_units(rec["recips"], unit_info) or "—"
+        sent = rec["sent_dt"]
+        sent_txt = f"Sent {_fmt_date(sent)}" if pd.notna(sent) else ""
+        subject = html.escape(rec["subject"])
+        summary_html = _linkify(summary or placeholder_summary)
+        tags_html = ("".join(
+            f'<span class="digest-tag" title="{html.escape(src)}">'
+            f'#{html.escape(body)}</span>' for body, src in tags)
+            if tags else placeholder_tags)
+        thumb = (f'<div class="digest-thumb"><img src="{html.escape(img)}" '
+                 f'alt=""></div>' if img
+                 else '<div class="digest-thumb">🖼️</div>')
+        blocks.append(
+            '<div class="digest-tile">'
+            f'{thumb}'
+            '<div class="digest-body">'
+            f'<div class="digest-units">{units_html}</div>'
+            f'<div class="digest-sent">{sent_txt}</div>'
+            f'<a class="digest-subject" href="{html.escape(rec["public_url"])}" '
+            f'target="_blank">{subject}</a>'
+            f'<div class="digest-summary">{summary_html}</div>'
+            f'<div class="digest-tags">{tags_html}</div>'
+            '</div></div>')
+    st.markdown("\n".join(blocks), unsafe_allow_html=True)
+
+    # Pager: Newer / Older with a position indicator, when there's >1 page.
+    if total > _DIGEST_MAX_TILES:
+        lo, hi = start + 1, start + len(tiles)
+        nav_l, nav_c, nav_r = st.columns([2, 4, 2], vertical_alignment="center")
+        with nav_l:
+            if page > 0:
+                st.button("‹ Newer", key="digest_prev", on_click=_digest_prev)
+        with nav_c:
+            st.markdown(
+                f'<div class="digest-page">Showing eNotices {lo}–{hi} '
+                f'of {total} (most recent first)</div>', unsafe_allow_html=True)
+        with nav_r:
+            if page < max_page:
+                st.button("Older ›", key="digest_next", on_click=_digest_next)
+
+    st.markdown(f'<div class="digest-scope">{html.escape(scope_note)}</div>',
+                unsafe_allow_html=True)
+
+
 def render_digest_view(digest, selected_norm, unit_info, end_date):
-    """Render the tiled digest of the most recent eNotices."""
+    """Render the tiled digest, with a search box over the selected units."""
     c_logo, c_title, c_link = st.columns([2, 6, 2],
                                          vertical_alignment="center")
     with c_logo:
@@ -1229,152 +1433,48 @@ def render_digest_view(digest, selected_norm, unit_info, end_date):
         st.markdown('<div class="digest-title">Your IEEE eNotice Digest</div>',
                     unsafe_allow_html=True)
     with c_link:
-        st.button("Digest Archive", key="to_archive", on_click=_go_archive)
+        st.button("Table view (internal)", key="to_archive",
+                  on_click=_go_archive)
 
     date_txt = _fmt_full_date(end_date) if end_date is not None else ""
     st.markdown('<hr class="digest-rule">'
                 f'<div class="digest-date">{date_txt}</div>',
                 unsafe_allow_html=True)
 
-    # All eNotices to the selected units within the sidebar date range, newest
-    # first, shown a page (`_DIGEST_MAX_TILES`) at a time.
-    all_tiles = digest.sort_values("_sent_dt", ascending=False)
-    total = len(all_tiles)
+    # Search box + info popover (how search works here vs. in production).
+    c_q, c_i = st.columns([20, 1], vertical_alignment="center")
+    with c_q:
+        query = st.text_input(
+            "Search eNotices", key="digest_search",
+            placeholder="Search recent eNotices from your selected units…",
+            label_visibility="collapsed").strip()
+    with c_i:
+        with st.popover("ℹ️"):
+            st.markdown(_SEARCH_HELP)
 
-    # Reset to the first (top) page whenever the result set changes.
-    sig = (end_date, tuple(all_tiles["id"].astype(str)))
-    if st.session_state.get("digest_page_sig") != sig:
-        st.session_state["digest_page_sig"] = sig
-        st.session_state["digest_page"] = 0
-    max_page = max(0, (total - 1) // _DIGEST_MAX_TILES)
-    page = min(max(st.session_state.get("digest_page", 0), 0), max_page)
-    st.session_state["digest_page"] = page
-    start = page * _DIGEST_MAX_TILES
-    tiles = all_tiles.iloc[start:start + _DIGEST_MAX_TILES]
-
-    if tiles.empty:
-        st.info("No eNotices to display for the selected units within the "
-                "sidebar date range. Widen the date range or adjust your "
-                "selection in the sidebar.")
-    else:
-        placeholder_summary = (
-            "Placeholder summary: a concise two- to three-sentence AI-generated "
-            "overview of this eNotice will appear here, highlighting its key "
-            "details and purpose. Final wording is pending integration.")
-        placeholder_tags = "".join(
-            f'<span class="digest-tag" title="Placeholder tag (AI tag '
-            f'generation unavailable)">#{t}</span>'
-            for t in ("PlaceholderOne", "PlaceholderTwo", "PlaceholderThree"))
-        rows = [row for _, row in tiles.iterrows()]
-        metas = []
-        for r in rows:
-            event_url = str(r.get("event_url", "") or "")
-            event_id = (str(r.get("event_id", "") or "").strip()
-                        or _event_id_from_url(event_url))
-            metas.append(
-                ("https://enotice.vtools.ieee.org/public/" + str(r.get("id", "")),
-                 event_id,
-                 str(r.get("mailing_subject", "") or "")))
-
-        # Summaries, tile images, and tags for the displayed notices,
-        # fetched/generated in parallel and cached per notice so reruns don't
-        # re-spend credits. The wait is a prototype artifact: in production this
-        # content would be created once, when each eNotice is published, so the
-        # digest would load instantly. Here we generate it on demand and report
-        # per-notice progress.
-        n_tiles = len(metas)
+    if query:
+        records = _search_records(query, selected_norm)
+        st.caption(f"{len(records)} recent eNotice(s) matching your search.")
         scope_note = (
-            f"This prototype shows the eNotices sent to your selected units "
+            "In this prototype, search scans your selected units' recent "
+            "eNotices from the live IEEE eNotice feed and shows those matching "
+            "your terms -- most recent first. See the info icon by the search "
+            "box for how this differs from production.")
+        empty_msg = ("No recent eNotices from your selected units match your "
+                     "search. Try different or fewer terms, or clear the search "
+                     "box to return to the digest.")
+        _render_tile_page(records, unit_info, scope_note, empty_msg)
+    else:
+        scope_note = (
+            "This prototype shows the eNotices sent to your selected units "
             "within the date range set in the sidebar, from the selected data "
             f"file -- most recent first, {_DIGEST_MAX_TILES} at a time. Use the "
             "Newer/Older controls to move through them.")
-        note = st.empty()
-        note.caption(
-            "This short wait is specific to the prototype: eNotice summaries, "
-            "images, and tags are being generated on demand as you open the "
-            "digest. In a production system this content would be created once, "
-            "when each eNotice is published, so your digest would load instantly."
-            "\n\n" + scope_note)
-        progress = st.progress(0.0, text=f"Preparing eNotice 1 of {n_tiles}...")
-
-        results = [None] * n_tiles
-
-        def _prepare(m):
-            public_url, event_id, subj = m
-            summary = enotice_summary(public_url, event_id)
-            return (summary,
-                    enotice_image(public_url, event_id, subj),
-                    enotice_tags(subj, summary, event_id))
-
-        with concurrent.futures.ThreadPoolExecutor(
-                max_workers=_MAX_WORKERS) as pool:
-            futures = {pool.submit(_prepare, m): i for i, m in enumerate(metas)}
-            done = 0
-            for fut in concurrent.futures.as_completed(futures):
-                results[futures[fut]] = fut.result()
-                done += 1
-                progress.progress(
-                    done / n_tiles,
-                    text=f"Preparing eNotice {done} of {n_tiles}...")
-
-        summaries = [r[0] for r in results]
-        images = [r[1] for r in results]
-        tags_list = [r[2] for r in results]
-        progress.empty()
-        note.empty()
-
-        blocks = []
-        for row, (public_url, _eid, subj), summary, img, tags in zip(
-                rows, metas, summaries, images, tags_list):
-            recips = (parse_recipient_spoids(row.get("recipient_SPOIDs", ""))
-                      & selected_norm)
-            units_html = _join_units(recips, unit_info) or "—"
-            sent = row["_sent_dt"]
-            sent_txt = f"Sent {_fmt_date(sent)}" if pd.notna(sent) else ""
-            subject = html.escape(subj)
-            summary_html = _linkify(summary or placeholder_summary)
-            tags_html = ("".join(
-                f'<span class="digest-tag" title="{html.escape(src)}">'
-                f'#{html.escape(body)}</span>' for body, src in tags)
-                if tags else placeholder_tags)
-            thumb = (f'<div class="digest-thumb"><img src="{html.escape(img)}" '
-                     f'alt=""></div>' if img
-                     else '<div class="digest-thumb">🖼️</div>')
-            blocks.append(
-                '<div class="digest-tile">'
-                f'{thumb}'
-                '<div class="digest-body">'
-                f'<div class="digest-units">{units_html}</div>'
-                f'<div class="digest-sent">{sent_txt}</div>'
-                f'<a class="digest-subject" href="{html.escape(public_url)}" '
-                f'target="_blank">{subject}</a>'
-                f'<div class="digest-summary">{summary_html}</div>'
-                f'<div class="digest-tags">{tags_html}</div>'
-                '</div></div>')
-        st.markdown("\n".join(blocks), unsafe_allow_html=True)
-
-        # Pager: Newer (unless on the top page) / Older (unless on the last),
-        # with a position indicator. Only shown when there is more than one page.
-        if total > _DIGEST_MAX_TILES:
-            lo, hi = start + 1, start + len(tiles)
-            nav_l, nav_c, nav_r = st.columns([2, 4, 2],
-                                             vertical_alignment="center")
-            with nav_l:
-                if page > 0:
-                    st.button("‹ Newer", key="digest_prev",
-                              on_click=_digest_prev)
-            with nav_c:
-                st.markdown(
-                    f'<div class="digest-page">Showing eNotices {lo}–{hi} '
-                    f'of {total} (most recent first)</div>',
-                    unsafe_allow_html=True)
-            with nav_r:
-                if page < max_page:
-                    st.button("Older ›", key="digest_next",
-                              on_click=_digest_next)
-
-        st.markdown(f'<div class="digest-scope">{html.escape(scope_note)}</div>',
-                    unsafe_allow_html=True)
+        empty_msg = ("No eNotices to display for the selected units within the "
+                     "sidebar date range. Widen the date range or adjust your "
+                     "selection in the sidebar.")
+        _render_tile_page(_csv_records(digest, selected_norm), unit_info,
+                          scope_note, empty_msg)
 
     agg = _join_units(selected_norm, unit_info)
     st.markdown(f'<div class="digest-agg">This digest aggregates content from '
