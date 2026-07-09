@@ -177,13 +177,13 @@ environment on startup; the password gate also reads `APP_PASSWORD`).
 
 ### Taxonomy source
 
-`taxonomy/ieee_taxonomy.csv` was derived from the **IEEE Taxonomy** PDF, published
-by IEEE at
-<https://www.ieee.org/content/dam/ieee-org/ieee/web/org/pubs/ieee-taxonomy.pdf>
-(the copy used for this prototype was obtained from a conference mirror,
-<https://apmc-mwe.org/apmc2022/pdf/IEEE_Taxonomy.pdf>). The CSV flattens the
-document's term hierarchy into one row per term, with each term's full ancestor
-path in the `full_path` column. The IEEE Taxonomy is © IEEE.
+`taxonomy/ieee_taxonomy.csv` is derived from the **IEEE Taxonomy** (January 2026,
+Version 1.05), published by IEEE at
+<https://ieee-org.widen.net/s/jwk9pcxxvd/ieee-taxonomy>. The CSV flattens the
+document's term hierarchy into one row per term — 8,037 terms across 51
+term‑families — with each term's full ancestor path in the `full_path` column.
+The source PDF is kept locally in `taxonomy/` (git‑ignored, `*.pdf`). The IEEE
+Taxonomy is © IEEE.
 
 ## Deployment (Streamlit Community Cloud)
 
