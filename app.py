@@ -21,7 +21,6 @@ import html
 import json
 import os
 import re
-import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
@@ -73,8 +72,12 @@ _TAX_DEEP_LEVEL = 2
 # vTools Events API: structured event data (tags, category, location, content)
 # by event id. Preferred over scraping the event_url HTML page.
 _EVENTS_API = "https://events.vtools.ieee.org/api/public/v5/events/list?id={}"
-# Public eNotice atom feed: recent eNotices for a unit (used by digest search).
-_ENOTICE_FEED = "https://enotice.vtools.ieee.org/public/feed.atom?org_unit={}"
+
+# Digest search: scan the full text of the newest this-many eNotices in the
+# current digest (selected units + sidebar date range) and keep those whose
+# public page matches every search term.
+_SEARCH_SCAN_LIMIT = 200
+_SEARCH_TEXT_CAP = 20000  # chars of page text kept for term matching
 
 # Tile image: OpenAI generation (fallback when no suitable page image exists).
 _IMAGE_MODEL = "gpt-image-1"
@@ -544,57 +547,15 @@ def _strip_html(doc, cap=6000):
     return re.sub(r"\s+", " ", text).strip()[:cap]
 
 
-def _fetch_text(url):
+def _fetch_text(url, cap=6000):
     """Visible text of a page (scripts/markup stripped, capped)."""
-    return _strip_html(_fetch_raw(url))
+    return _strip_html(_fetch_raw(url), cap=cap)
 
 
 def _event_id_from_url(event_url):
     """The numeric event id embedded in a vTools event URL (…/m/<id>), or ''."""
     m = re.search(r"/m/(\d+)", str(event_url or ""))
     return m.group(1) if m else ""
-
-
-@st.cache_data(show_spinner=False, ttl=1800)
-def enotice_feed(spoid):
-    """Recent eNotices for a unit, from the public atom feed.
-
-    Returns a list of dicts: {id, public_url, title, published (Timestamp|NaT),
-    text}. `text` is the title plus the body (markup stripped) for searching.
-    Empty on any failure. Cached per unit.
-    """
-    spoid = (spoid or "").strip()
-    if not spoid:
-        return []
-    try:
-        resp = _HTTP.request("GET", _ENOTICE_FEED.format(spoid),
-                             timeout=_FETCH_TIMEOUT)
-        if resp.status != 200 or not resp.data:
-            return []
-        root = ET.fromstring(resp.data)  # bytes -> honors XML encoding decl
-    except Exception:
-        return []
-    ns = {"a": "http://www.w3.org/2005/Atom"}
-    out = []
-    for e in root.findall("a:entry", ns):
-        title = (e.findtext("a:title", namespaces=ns) or "").strip()
-        link = ""
-        for lk in e.findall("a:link", ns):
-            if lk.get("href") and lk.get("rel") in (None, "alternate"):
-                link = lk.get("href")
-                break
-        m = (re.search(r"/(\d+)/?$", link)
-             or re.search(r"Mailing/(\d+)",
-                          e.findtext("a:id", namespaces=ns) or ""))
-        eid = m.group(1) if m else ""
-        body = _strip_html((e.findtext("a:content", namespaces=ns) or "") + " "
-                           + (e.findtext("a:summary", namespaces=ns) or ""))
-        published = pd.to_datetime(
-            e.findtext("a:published", namespaces=ns) or "", errors="coerce",
-            utc=True)
-        out.append({"id": eid, "public_url": link, "title": title,
-                    "published": published, "text": f"{title} {body}"})
-    return out
 
 
 @st.cache_data(show_spinner=False, ttl=86400)
@@ -1265,15 +1226,15 @@ def _settings_dialog():
 
 _SEARCH_HELP = (
     "**How search works in this prototype**\n\n"
-    "Search scans the text of your selected units' **recent eNotices** -- "
-    "fetched live from the public IEEE eNotice feed -- and shows the ones that "
-    "contain all of your terms. Because summaries, images, and tags are "
-    "generated on demand here, search matches the eNotice **content**, and it "
-    "covers the recent notices the feed returns (independent of the data file "
-    "and date range set in the sidebar).\n\n"
+    "Search looks within the same eNotices as your digest -- those sent to "
+    "your selected units within the sidebar date range. It scans the full "
+    f"text of the **{_SEARCH_SCAN_LIMIT} most recent** of those notices "
+    "(fetched live from their public IEEE eNotice pages) and shows the ones "
+    "that contain all of your terms, newest first.\n\n"
     "**In production**, every eNotice in your digest would already have a "
-    "summary and tags, so search would filter your digest **instantly** by "
-    "matching those **tags and summaries** across your full set of notices.")
+    "summary and tags, so search would filter your **entire** digest "
+    "**instantly** by matching those **tags and summaries** -- with no live "
+    "page fetching or scan limit.")
 
 
 def _csv_records(digest, selected_norm):
@@ -1294,29 +1255,49 @@ def _csv_records(digest, selected_norm):
     return recs
 
 
-def _search_records(query, selected_norm):
-    """Tile records from the live eNotice feeds of the selected units, matching
-    every whitespace-separated term (case-insensitive) in the title + body."""
+def _search_records(digest, selected_norm, query):
+    """Digest records whose eNotice matches every whitespace-separated term.
+
+    Scopes to the same records as the digest (selected units + date range),
+    takes the newest ``_SEARCH_SCAN_LIMIT``, fetches each one's public page,
+    and keeps those whose subject + page text contain all terms (case-
+    insensitive). A progress bar reports the live-scan phase. Newest first.
+    """
     terms = [t for t in query.lower().split() if t]
     if not terms:
         return []
-    spoids = sorted(selected_norm)
-    by_id = {}
+    candidates = _csv_records(digest, selected_norm)[:_SEARCH_SCAN_LIMIT]
+    if not candidates:
+        return []
+
+    n = len(candidates)
+    note = st.empty()
+    note.caption(
+        "Searching the full text of your selected units' recent eNotices by "
+        "fetching their public pages. In production this would match "
+        "pre-generated tags and summaries instantly, with no scan.")
+    progress = st.progress(0.0, text=f"Scanning eNotice 1 of {n}...")
+
+    def _matches(rec):
+        text = (rec["subject"] + " "
+                + _fetch_text(rec["public_url"], cap=_SEARCH_TEXT_CAP)).lower()
+        return all(t in text for t in terms)
+
+    hits = [False] * n
     with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
-        for sp, entries in zip(spoids, pool.map(enotice_feed, spoids)):
-            for e in entries:
-                key = e["id"] or e["public_url"]
-                if not key:
-                    continue
-                by_id.setdefault(key, {**e, "recips": set()})["recips"].add(sp)
-    matched = [r for r in by_id.values()
-               if all(t in r["text"].lower() for t in terms)]
-    matched.sort(
-        key=lambda r: r["published"].value if pd.notna(r["published"]) else -1,
-        reverse=True)
-    return [{"public_url": r["public_url"], "event_id": "",
-             "subject": r["title"], "sent_dt": r["published"],
-             "recips": r["recips"]} for r in matched]
+        futures = {pool.submit(_matches, rec): i
+                   for i, rec in enumerate(candidates)}
+        done = 0
+        for fut in concurrent.futures.as_completed(futures):
+            hits[futures[fut]] = fut.result()
+            done += 1
+            progress.progress(done / n,
+                              text=f"Scanning eNotice {done} of {n}...")
+    progress.empty()
+    note.empty()
+
+    # candidates are already newest-first; keep that order for the matches.
+    return [rec for rec, hit in zip(candidates, hits) if hit]
 
 
 def _render_tile_page(records, unit_info, scope_note, empty_msg):
@@ -1446,23 +1427,24 @@ def render_digest_view(digest, selected_norm, unit_info, end_date):
     with c_q:
         query = st.text_input(
             "Search eNotices", key="digest_search",
-            placeholder="Search recent eNotices from your selected units…",
+            placeholder="Search your digest's eNotices by full-text content…",
             label_visibility="collapsed").strip()
     with c_i:
         with st.popover("ℹ️"):
             st.markdown(_SEARCH_HELP)
 
     if query:
-        records = _search_records(query, selected_norm)
-        st.caption(f"{len(records)} recent eNotice(s) matching your search.")
+        records = _search_records(digest, selected_norm, query)
+        st.caption(f"{len(records)} eNotice(s) matching your search.")
         scope_note = (
-            "In this prototype, search scans your selected units' recent "
-            "eNotices from the live IEEE eNotice feed and shows those matching "
+            "In this prototype, search scans the full text of the "
+            f"{_SEARCH_SCAN_LIMIT} most recent eNotices in your digest "
+            "(selected units + sidebar date range) and shows those matching "
             "your terms -- most recent first. See the info icon by the search "
             "box for how this differs from production.")
-        empty_msg = ("No recent eNotices from your selected units match your "
-                     "search. Try different or fewer terms, or clear the search "
-                     "box to return to the digest.")
+        empty_msg = ("None of your digest's recent eNotices match your search. "
+                     "Try different or fewer terms, widen the sidebar date "
+                     "range, or clear the search box to return to the digest.")
         _render_tile_page(records, unit_info, scope_note, empty_msg)
     else:
         scope_note = (
