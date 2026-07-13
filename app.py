@@ -1633,10 +1633,39 @@ def render_preferences_view(df, selected_norm, unit_info):
                     key=fkey, label_visibility="collapsed",
                     disabled=not unit_checked[u])
 
+        # Priority Tags and Tags to Exclude both pick from the tags in the
+        # member's current archive. A tag can't be on both lists; a shared
+        # on-change handler removes any overlap, with Priority winning.
+        tag_options = sorted(seen.values(), key=str.lower)
+
+        def _dedupe_tag_lists():
+            prio_set = set(st.session_state.get(p + "priority", []))
+            if prio_set:
+                st.session_state[p + "excl"] = [
+                    t for t in st.session_state.get(p + "excl", [])
+                    if t not in prio_set]
+
+        st.markdown("#### Priority Tags")
+        st.caption("eNotices tagged with any of these hashtags are delivered "
+                   "immediately — even from a unit set to a digest, and even if "
+                   "they also carry an excluded tag (they'll still appear in "
+                   "your archive). Tags come from your recent eNotices.")
+        if tag_options:
+            prio = st.multiselect(
+                "Priority tags", options=tag_options,
+                default=[t for t in saved.get("priority_terms", [])
+                         if t in tag_options],
+                format_func=lambda b: f"#{b}",
+                key=p + "priority", label_visibility="collapsed",
+                on_change=_dedupe_tag_lists,
+                placeholder="Choose priority tags…")
+        else:
+            prio = []
+
         st.markdown("#### Tags to Exclude")
         st.caption("eNotices tagged with any of these hashtags won't be sent to "
-                   "you. Tags come from your recent eNotices.")
-        tag_options = sorted(seen.values(), key=str.lower)
+                   "you, unless they also carry a priority tag. Tags come from "
+                   "your recent eNotices.")
         if tag_options:
             excl = st.multiselect(
                 "Tags to exclude", options=tag_options,
@@ -1644,9 +1673,12 @@ def render_preferences_view(df, selected_norm, unit_info):
                          if t in tag_options],
                 format_func=lambda b: f"#{b}",
                 key=p + "excl", label_visibility="collapsed",
+                on_change=_dedupe_tag_lists,
                 placeholder="Choose tags to exclude…")
         else:
             excl = []
+
+        if not tag_options:
             st.info("Tags will appear here once your eNotice Archive has loaded "
                     "some eNotices — open your archive first, then return here. "
                     "This is specific to the prototype, where tags are "
@@ -1675,12 +1707,17 @@ def render_preferences_view(df, selected_norm, unit_info):
     _render_ieee_footer()
 
     if save:
+        prio_terms = list(prio)
+        prio_set = set(prio_terms)
+        excl_terms = [t for t in excl if t not in prio_set]  # Priority wins
         prefs = st.session_state.setdefault("saved_prefs", {})
         prefs[sig] = {
             "units": {u for u in units_sorted if unit_checked[u]},
             "frequencies": {u: unit_freq[u] for u in units_sorted},
-            "exclude_terms": list(excl),
-            "exclude_bodies": {b.lower() for b in excl},
+            "priority_terms": prio_terms,
+            "priority_bodies": {b.lower() for b in prio_terms},
+            "exclude_terms": excl_terms,
+            "exclude_bodies": {b.lower() for b in excl_terms},
         }
         st.session_state.view = "digest"
         st.rerun()
@@ -1776,13 +1813,16 @@ def _search_records(digest, selected_norm, query):
 
 
 def _render_tile_page(records, unit_info, scope_note, empty_msg,
-                      exclude_bodies=frozenset(), collect_tags=False):
+                      exclude_bodies=frozenset(), collect_tags=False,
+                      priority_bodies=frozenset()):
     """Paginate `records`, generate each tile's summary/image/tags, and render.
 
     `exclude_bodies` is a set of lower-cased tag bodies (from the preferences
     center's Tags to Exclude); a tile whose generated tags include any of them
-    is hidden. Because tags are produced per tile as the page is prepared, the
-    exclusion is applied to the current page after generation.
+    is hidden. `priority_bodies` (Priority Tags) overrides that: a tile with a
+    priority tag is never hidden by an excluded tag, and its priority tag chips
+    are styled distinctly. Because tags are produced per tile as the page is
+    prepared, both are applied to the current page after generation.
 
     When `collect_tags` is set, every tag produced on this page is recorded in
     `st.session_state["seen_tags"]` (before exclusion), so the preferences
@@ -1851,11 +1891,25 @@ def _render_tile_page(records, unit_info, scope_note, empty_msg,
                 if body:
                     seen[body.lower()] = body
 
+    def _tag_span(body, src):
+        """One tag chip. Priority tags are styled distinctly and their hover
+        text notes that they trigger immediate delivery."""
+        if body.lower() in priority_bodies:
+            title = (f"{src} · Priority tag — eNotices with this tag are "
+                     "delivered immediately")
+            cls = "digest-tag digest-tag-priority"
+        else:
+            title, cls = src, "digest-tag"
+        return (f'<span class="{cls}" title="{html.escape(title)}">'
+                f'#{html.escape(body)}</span>')
+
     blocks = []
     excluded = 0
     for rec, (summary, img, tags) in zip(tiles, results):
-        if exclude_bodies and tags and any(
-                body.lower() in exclude_bodies for body, _src in tags):
+        tag_bodies = {body.lower() for body, _src in (tags or [])}
+        is_priority = bool(tag_bodies & priority_bodies)
+        # Excluded tiles are hidden -- unless a priority tag overrides that.
+        if exclude_bodies and (tag_bodies & exclude_bodies) and not is_priority:
             excluded += 1
             continue
         units_html = _join_units(rec["recips"], unit_info) or "—"
@@ -1863,10 +1917,8 @@ def _render_tile_page(records, unit_info, scope_note, empty_msg,
         sent_txt = f"Sent {_fmt_date(sent)}" if pd.notna(sent) else ""
         subject = html.escape(rec["subject"])
         summary_html = _linkify(summary or placeholder_summary)
-        tags_html = ("".join(
-            f'<span class="digest-tag" title="{html.escape(src)}">'
-            f'#{html.escape(body)}</span>' for body, src in tags)
-            if tags else placeholder_tags)
+        tags_html = ("".join(_tag_span(body, src) for body, src in tags)
+                     if tags else placeholder_tags)
         thumb = (f'<div class="digest-thumb"><img src="{html.escape(img)}" '
                  f'alt=""></div>' if img
                  else '<div class="digest-thumb">🖼️</div>')
@@ -1922,6 +1974,7 @@ def render_digest_view(df, digest, selected_norm, unit_info, end_date):
     effective_norm = (selected_norm if included is None
                       else {s for s in selected_norm if s in included})
     exclude_bodies = saved.get("exclude_bodies", frozenset())
+    priority_bodies = saved.get("priority_bodies", frozenset())
     if included is not None:
         digest = digest[digest["recipient_SPOIDs"].apply(
             lambda c: matches_recipients(c, effective_norm))]
@@ -1965,7 +2018,7 @@ def render_digest_view(df, digest, selected_norm, unit_info, end_date):
                      "search. Try different or fewer terms, or clear the search "
                      "box to return to the digest.")
         _render_tile_page(records, unit_info, scope_note, empty_msg,
-                          exclude_bodies)
+                          exclude_bodies, priority_bodies=priority_bodies)
     else:
         scope_note = (
             "This prototype shows the eNotices sent to your selected units "
@@ -1978,7 +2031,7 @@ def render_digest_view(df, digest, selected_norm, unit_info, end_date):
                      "Organizational Units under “Manage your digest settings.”")
         _render_tile_page(_csv_records(digest, effective_norm), unit_info,
                           scope_note, empty_msg, exclude_bodies,
-                          collect_tags=True)
+                          collect_tags=True, priority_bodies=priority_bodies)
 
     agg = _join_units(effective_norm, unit_info)
     if agg:
@@ -2000,8 +2053,9 @@ def render_digest_freq_view(freq, digest, selected_norm, unit_info):
     _render_view_picker(selected_norm)
 
     units_f = _active_digest_freqs(selected_norm).get(freq, set())
-    exclude_bodies = _saved_prefs(selected_norm).get("exclude_bodies",
-                                                     frozenset())
+    _saved = _saved_prefs(selected_norm)
+    exclude_bodies = _saved.get("exclude_bodies", frozenset())
+    priority_bodies = _saved.get("priority_bodies", frozenset())
     period_word = {"Daily Digest": "day", "Weekly Digest": "week",
                    "Monthly Digest": "month"}[freq]
 
@@ -2063,7 +2117,8 @@ def render_digest_freq_view(freq, digest, selected_norm, unit_info):
                  "excluded tags. Adjust your excluded tags in the Preferences "
                  "Center.")
     _render_tile_page(_csv_records(period_rows, units_f), unit_info,
-                      scope_note, empty_msg, exclude_bodies)
+                      scope_note, empty_msg, exclude_bodies,
+                      priority_bodies=priority_bodies)
 
     agg = _join_units(units_f, unit_info)
     if agg:
@@ -2132,6 +2187,11 @@ st.markdown(
     .digest-tag { display: inline-block; background: #E7EEF4; color: #00629B;
                   font-size: 0.8rem; padding: 0.1rem 0.55rem; border-radius: 12px;
                   margin: 0 0.35rem 0.25rem 0; cursor: help; }
+    /* Priority tag chips: orange instead of the blue of ordinary tags, so they
+       stand out in the tag list. */
+    .digest-tag-priority { background: #FFE7C6; color: #1a1a1a; font-weight: 700;
+                           box-shadow: inset 0 0 0 1px #E87722; }
+    .digest-tag-priority::before { content: "★ "; color: #E87722; }
     .digest-page { text-align: center; color: #444; font-size: 0.9rem; }
     .digest-scope { text-align: center; color: #777; margin-top: 1rem;
                     font-size: 0.85rem; font-style: italic; }
