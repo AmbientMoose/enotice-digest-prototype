@@ -1,6 +1,12 @@
-streamlit>=1.39
+# Upper bounds keep Streamlit Cloud from resolving to a bleeding-edge stack.
+# In particular, pandas 3.0 makes the PyArrow-backed string dtype the default,
+# which segfaults read_csv on the current Cloud image; the prototype was built
+# and tested against pandas 2.x (numpy object strings). st.segmented_control
+# needs Streamlit >= 1.40.
+streamlit>=1.40,<2
 streamlit-searchbox>=0.1.20
 urllib3>=2.0
-pandas>=2.0
+pandas>=2.0,<3
+numpy<2.3
 anthropic>=0.39
 openai>=1.0
