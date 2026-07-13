@@ -261,12 +261,14 @@ def _fetch_many(spoids):
     return out
 
 
-def _walk(start_ou, edges_of, seen, collected):
+def _walk(start_ou, edges_of, seen, collected, progress=None):
     """Breadth-first walk in one direction (parents or children).
 
     ``edges_of(ou)`` returns the next SPOIDs to consider. A node is added to
     ``collected`` and expanded only if it fetches successfully and is not an
     excluded type; excluded nodes are neither shown nor traversed through.
+    ``progress(len(collected))``, when given, is called after each BFS level so
+    callers can drive a progress indicator as units are discovered.
     """
     frontier = [start_ou]
     while frontier:
@@ -286,11 +288,18 @@ def _walk(start_ou, edges_of, seen, collected):
                 continue
             collected[ou.spoid] = ou
             frontier.append(ou)
+        if progress is not None:
+            progress(len(collected))
 
 
-@st.cache_data(show_spinner=False)
-def related_units(section_spoid):
+def related_units(section_spoid, progress=None):
     """Return {spoid: OU} for the Section plus its ancestors and descendants.
+
+    ``progress`` is an optional ``callable(units_found_so_far)`` called after
+    each BFS level so the caller can drive a progress bar. This function is not
+    ``@st.cache_data``-cached (so ``progress`` may safely update a Streamlit
+    element); the sidebar memoizes the result per Section in ``st.session_state``
+    instead.
 
     Parents/children are the OU List API edges supplemented by the reciprocity
     data (as in the OU Explorer). Academic/Grouping/Other units are excluded
@@ -311,21 +320,17 @@ def related_units(section_spoid):
         return list(ou.children) + \
             extra_children.get(resolve_spoid(ou.spoid), [])
 
-    _walk(root, parents_of, seen, collected)     # ancestors
-    _walk(root, children_of, seen, collected)    # descendants
+    _walk(root, parents_of, seen, collected, progress)   # ancestors
+    _walk(root, children_of, seen, collected, progress)  # descendants
     return collected
 
 
-@st.cache_data(show_spinner=False)
-def recipient_pool(section_spoid, filename):
-    """Related units that received at least one eNotice in the file.
-
-    The selectable list in the Related-units picker: the Section plus its
-    ancestors/descendants (Academic/Grouping/Other already excluded), kept only
-    if they were a recipient in the chosen file.
-    """
+def recipient_pool(related, filename):
+    """Related units that received at least one eNotice in the file -- the
+    selectable list in the Related-units picker (kept only if a recipient in the
+    chosen file). Derived from an already-computed related-units map."""
     recipients = load_recipient_spoids(filename)
-    return {u: ou for u, ou in related_units(section_spoid).items()
+    return {u: ou for u, ou in related.items()
             if resolve_spoid(u) in recipients}
 
 
@@ -350,9 +355,9 @@ def section_ancestors(section_spoid):
     return collected
 
 
-@st.cache_data(show_spinner=False)
-def society_links(section_spoid):
-    """Map the Section's chapters to the selectable Societies that parent them.
+def society_links(related):
+    """Map the Section's chapters to the selectable Societies that parent them,
+    from an already-computed related-units map.
 
     Returns (chapters_by_soc, sbc_links):
       chapters_by_soc[society_spoid] -> [Chapter / Joint Chapter spoids] whose
@@ -363,7 +368,6 @@ def society_links(section_spoid):
     society_spoids are normalized and limited to the Societies in units.csv.
     """
     societies = {resolve_spoid(r["spoid"]) for r in load_society_index()}
-    related = related_units(section_spoid)
     _ec, extra_parents = load_supplements()
     chapters_by_soc, sbc_links = {}, []
     for sp, ou in related.items():
@@ -1240,12 +1244,75 @@ def _join_units(spoids, unit_info):
     return ", ".join(links[:-1]) + ", and " + links[-1]
 
 
-def _go_archive():
-    st.session_state.view = "archive"
-
-
 def _go_digest():
     st.session_state.view = "digest"
+
+
+def _go_prefs():
+    st.session_state.view = "preferences"
+
+
+# View picker: one control (upper-left of every page) replacing the old
+# cross-links. Labels map to the internal `view` session-state values. The
+# Daily/Weekly/Monthly digest views appear only when the member has assigned
+# that frequency to at least one included unit (see _active_digest_freqs).
+_VIEW_LABELS = {
+    "archive": "Table View",
+    "digest": "eNotice Archive",
+    "daily": "Daily Digest",
+    "weekly": "Weekly Digest",
+    "monthly": "Monthly Digest",
+    "preferences": "Preferences Center",
+}
+_VIEW_BY_LABEL = {label: view for view, label in _VIEW_LABELS.items()}
+# Frequency label (as stored in preferences) -> its view key, in picker order.
+_FREQ_VIEW = {"Daily Digest": "daily", "Weekly Digest": "weekly",
+              "Monthly Digest": "monthly"}
+_VIEW_FREQ = {view: freq for freq, view in _FREQ_VIEW.items()}
+
+
+def _active_digest_freqs(selected_norm):
+    """{frequency_label: {units}} for each digest frequency that has at least
+    one *included* unit assigned to it in the saved preferences. Immediate units
+    (individual emails) and fully-excluded units are not counted."""
+    saved = _saved_prefs(selected_norm)
+    freqs = saved.get("frequencies", {})
+    included = saved.get("units")
+    out = {}
+    for u in selected_norm:
+        if included is not None and u not in included:
+            continue
+        f = freqs.get(u)
+        if f in _FREQ_VIEW:
+            out.setdefault(f, set()).add(u)
+    return out
+
+
+def _on_view_pick():
+    label = st.session_state.get("view_picker")
+    if label in _VIEW_BY_LABEL:
+        st.session_state.view = _VIEW_BY_LABEL[label]
+
+
+def _render_view_picker(selected_norm):
+    """A segmented view switcher shown at the upper-left of every page. The
+    Daily/Weekly/Monthly options are included only when active."""
+    active = _active_digest_freqs(selected_norm)
+    options = ["eNotice Archive", "Preferences Center"]
+    options += [f for f in _FREQ_VIEW if f in active]  # Daily, Weekly, Monthly
+    options.append("Table View")
+    cur = _VIEW_LABELS.get(st.session_state.get("view", "digest"),
+                           "eNotice Archive")
+    if cur not in options:  # e.g. a digest view whose frequency is now inactive
+        cur = "eNotice Archive"
+    # Keep the widget in sync when the view changes by other means (e.g. Save).
+    if st.session_state.get("view_picker") != cur:
+        st.session_state["view_picker"] = cur
+    c, _ = st.columns([5, 2])
+    with c:
+        st.segmented_control(
+            "View", options, key="view_picker",
+            on_change=_on_view_pick, label_visibility="collapsed")
 
 
 def _digest_prev():
@@ -1257,10 +1324,418 @@ def _digest_next():
     st.session_state["digest_page"] = st.session_state.get("digest_page", 0) + 1
 
 
-@st.dialog("Digest settings")
-def _settings_dialog():
-    st.write("Digest settings can currently be adjusted in the sidebar. In the "
-             "future, this will be managed through your IEEE profile settings.")
+# --------------------------------------------------------------------------- #
+# Preferences center (member-facing "Manage your digest settings" page)
+
+_FREQ_OPTIONS = ["Immediate", "Daily Digest", "Weekly Digest", "Monthly Digest"]
+
+
+def _pref_sig(selected_norm):
+    """Stable key for the current sidebar unit selection, so saved preferences
+    reset automatically when the selection changes."""
+    return "|".join(sorted(selected_norm))
+
+
+def _saved_prefs(selected_norm):
+    """The saved preferences dict for the current selection ({} if none)."""
+    return st.session_state.get("saved_prefs", {}).get(
+        _pref_sig(selected_norm), {})
+
+
+def _seen_tags(selected_norm):
+    """The set of tag bodies seen so far in the current digest display, as a
+    {lowercased: display} dict. It accumulates as digest tiles are rendered
+    (see `_render_tile_page`) and resets whenever the sidebar selection changes,
+    so the Tags-to-Exclude picker offers exactly the tags present in the
+    member's current digest."""
+    sig = _pref_sig(selected_norm)
+    if st.session_state.get("seen_tags_sig") != sig:
+        st.session_state["seen_tags_sig"] = sig
+        st.session_state["seen_tags"] = {}
+    return st.session_state["seen_tags"]
+
+
+def _monthly_rates(df, selected_norm):
+    """Expected eNotices per month per selected unit, from the whole data file:
+    (that unit's received count across the file) / (months the file spans).
+    Returns ({spoid: emails_per_month_float}, months)."""
+    dates = df["_sent_dt"].dropna()
+    if dates.empty:
+        months = 1
+    else:
+        months = max(1, round((dates.max() - dates.min()).days / 30.44))
+    counts = Counter()
+    for cell in df["recipient_SPOIDs"]:
+        for u in parse_recipient_spoids(cell) & selected_norm:
+            counts[u] += 1
+    return {u: counts.get(u, 0) / months for u in selected_norm}, months
+
+
+def _fmt_rate(x):
+    """Format an emails-per-month rate: 0, '<1' for a small nonzero, else int."""
+    if x <= 0:
+        return "0"
+    if x < 0.5:
+        return "<1"
+    return str(round(x))
+
+
+def _expected_panel_html(rates, included):
+    """Right-column 'Expected Emails' panel for the included units.
+
+    The total is the sum of the per-unit rounded rates (not a separate rounding
+    of the raw sum) so the breakdown always adds up to the headline number."""
+    total = sum(round(rates.get(u, 0)) for u in included)
+    rows = "".join(
+        f'<div class="pref-row"><span class="pref-name">{html.escape(name)}</span>'
+        f'<span class="pref-count">{_fmt_rate(rates.get(u, 0))}</span></div>'
+        for u, name in sorted(included.items(),
+                              key=lambda kv: rates.get(kv[0], 0), reverse=True))
+    rows = rows or '<div class="pref-sub">No units included.</div>'
+    n = len(included)
+    return (
+        '<div class="pref-panel">'
+        '<div class="pref-panel-title">Expected Emails</div>'
+        '<div class="pref-sub">eNotices per month if you choose Immediate '
+        'delivery</div>'
+        f'<div class="pref-total">{_fmt_rate(total)}</div>'
+        f'<div class="pref-sub">{n} Organizational Unit'
+        f'{"" if n == 1 else "s"} included</div>'
+        '<div class="pref-breakdown-title">Breakdown by Organizational Unit</div>'
+        f'{rows}'
+        '</div>')
+
+
+# --------------------------------------------------------------------------- #
+# IEEE Account portal chrome (header + footer), modeled on
+# ieee.org/ieee-privacyportal, so the member-facing preferences page reads like
+# the real IEEE communication-preferences experience.
+
+# The header shows the signed-in member; per request it is a literal placeholder.
+_MEMBER_NAME = "[MEMBER NAME]"
+
+# Top utility bar items (left group). Rendered as plain text -- the header
+# deliberately carries no hyperlinks. "Xplore" is italicized like the portal.
+_IEEE_TOPNAV_LEFT = [
+    '<span class="ieee-home">⌂</span>&nbsp;IEEE.org',
+    'IEEE <em>Xplore</em> Digital Library',
+    'IEEE Standards',
+    'IEEE Spectrum',
+    'More Sites',
+]
+
+_IEEE_ABOUT_BLURB = (
+    "IEEE is the world's largest technical professional organization dedicated "
+    "to advancing technology for the benefit of humanity.")
+
+# Blue footer columns: (heading, blurb-or-None, [(label, href), ...]).
+_IEEE_FOOTER_COLS = [
+    ("About IEEE", _IEEE_ABOUT_BLURB, [
+        ("Learn more about IEEE", "https://www.ieee.org/about/index.html"),
+        ("IEEE Mission & Vision",
+         "https://www.ieee.org/about/vision-mission.html"),
+    ]),
+    ("Membership", None, [
+        ("Join", "https://www.ieee.org/membership/join/index.html"),
+        ("Renew", "https://www.ieee.org/membership/renew.html"),
+        ("Benefits", "https://www.ieee.org/membership/benefits.html"),
+        ("IEEE Collabratec", "https://ieee-collabratec.ieee.org"),
+    ]),
+    ("Get involved", None, [
+        ("Conferences", "https://www.ieee.org/conferences/index.html"),
+        ("Local activities", "https://www.ieee.org/communities/index.html"),
+        ("Publishing", "https://www.ieee.org/publications/index.html"),
+        ("Societies", "https://www.ieee.org/communities/societies/index.html"),
+        ("Councils", "https://www.ieee.org/communities/technical-councils.html"),
+        ("Technical careers", "https://careers.ieee.org"),
+        ("Volunteer", "https://www.ieee.org/volunteers/index.html"),
+    ]),
+]
+# "Connect with IEEE" column: an outlined Contact & Support button, then links.
+_IEEE_CONNECT = [
+    ("IEEE Collabratec", "https://ieee-collabratec.ieee.org"),
+    ("Careers at IEEE", "https://careers.ieee.org"),
+    ("IEEE Newsroom", "https://www.ieee.org/about/news/index.html"),
+    ("IEEE Media Kit", "https://www.ieee.org/about/news/media-kit.html"),
+]
+# Social icons (name, href, inline SVG path). White glyphs on the blue footer.
+_IEEE_SOCIAL = [
+    ("Facebook", "https://www.facebook.com/IEEE.org",
+     "M13 22v-8h2.7l.4-3H13V9.1c0-.9.3-1.5 1.6-1.5H16V5c-.3 0-1.2-.1-2.2-.1-2.2 "
+     "0-3.8 1.4-3.8 3.9V11H7.5v3H10v8h3z"),
+    ("Twitter", "https://twitter.com/IEEEorg",
+     "M23 4.9c-.8.4-1.7.6-2.6.8 1-.6 1.6-1.5 2-2.5-.9.5-1.9.9-2.9 1.1C18.6 3.4 "
+     "17.4 3 16.1 3c-2.5 0-4.5 2-4.5 4.5 0 .4 0 .7.1 1C8 8.3 5 6.6 3 3.9c-.4.7-.6 "
+     "1.5-.6 2.3 0 1.6.8 3 2 3.8-.7 0-1.4-.2-2-.5v.1c0 2.2 1.5 4 3.6 4.4-.4.1-.8."
+     "2-1.2.2-.3 0-.6 0-.8-.1.6 1.8 2.3 3.1 4.3 3.2-1.6 1.2-3.5 2-5.7 2-.4 0-.7 "
+     "0-1.1-.1C3.9 20.3 6.2 21 8.7 21c8.3 0 12.8-6.9 12.8-12.8v-.6c.9-.6 1.6-1.4 "
+     "2.2-2.3z"),
+    ("LinkedIn", "https://www.linkedin.com/company/ieee",
+     "M6.9 8.5H3.9V21h3V8.5zM5.4 3.5C4.4 3.5 3.7 4.2 3.7 5.1c0 .9.7 1.6 1.6 1.6.9 "
+     "0 1.6-.7 1.6-1.6 0-.9-.7-1.6-1.5-1.6zM20.3 21v-6.8c0-3.6-1.9-5.3-4.5-5.3-2.1 "
+     "0-3 1.1-3.5 1.9V8.5H9.3V21h3v-6.9c0-.4 0-.7.1-1 .3-.7.9-1.4 1.9-1.4 1.4 0 "
+     "1.9 1 1.9 2.6V21h3.1z"),
+    ("YouTube", "https://www.youtube.com/ieee",
+     "M23 12s0-3.2-.4-4.7c-.2-.8-.9-1.5-1.7-1.7C19.4 5.2 12 5.2 12 5.2s-7.4 0-8.9."
+     "4c-.8.2-1.5.9-1.7 1.7C1 8.8 1 12 1 12s0 3.2.4 4.7c.2.8.9 1.5 1.7 1.7 1.5.4 "
+     "8.9.4 8.9.4s7.4 0 8.9-.4c.8-.2 1.5-.9 1.7-1.7.4-1.5.4-4.7.4-4.7zM9.8 15.3V8.7"
+     "l6 3.3-6 3.3z"),
+    ("Instagram", "https://www.instagram.com/ieee_org",
+     "M12 4.5c2.4 0 2.7 0 3.6.1 2.5.1 3.6 1.3 3.7 3.7 0 .9.1 1.2.1 3.6s0 2.7-.1 "
+     "3.6c-.1 2.4-1.3 3.6-3.7 3.7-.9 0-1.2.1-3.6.1s-2.7 0-3.6-.1c-2.5-.1-3.6-1.3-"
+     "3.7-3.7 0-.9-.1-1.2-.1-3.6s0-2.7.1-3.6C4.9 5.9 6 4.7 8.4 4.6c.9 0 1.2-.1 "
+     "3.6-.1zM12 3c-2.4 0-2.8 0-3.7.1C5 3.2 3.2 5 3.1 8.3 3 9.2 3 9.6 3 12s0 2.8.1 "
+     "3.7c.1 3.3 1.9 5.1 5.2 5.2.9 0 1.3.1 3.7.1s2.8 0 3.7-.1c3.3-.1 5.1-1.9 5.2-"
+     "5.2 0-.9.1-1.3.1-3.7s0-2.8-.1-3.7c-.1-3.3-1.9-5.1-5.2-5.2C14.8 3 14.4 3 12 "
+     "3zm0 4.4a4.6 4.6 0 100 9.2 4.6 4.6 0 000-9.2zm0 7.6a3 3 0 110-6 3 3 0 010 "
+     "6zm4.8-7.8a1.1 1.1 0 100 2.2 1.1 1.1 0 000-2.2z"),
+]
+# Dark bottom legal strip: (label, href).
+_IEEE_FOOTER_LEGAL = [
+    ("Home", "https://www.ieee.org"),
+    ("Sitemap", "https://www.ieee.org/sitemap.html"),
+    ("Contact & Support", "https://supportcenter.ieee.org"),
+    ("Accessibility", "https://www.ieee.org/accessibility.html"),
+    ("NonDiscrimination Policy",
+     "https://www.ieee.org/about/corporate/governance/p9-26.html"),
+    ("Privacy & opting out of cookies",
+     "https://www.ieee.org/security-privacy.html"),
+    ("Feedback", "https://supportcenter.ieee.org"),
+]
+
+
+@st.cache_data(show_spinner=False)
+def _logo_data_uri():
+    """The IEEE logo as a data URI so it can be embedded in HTML chrome."""
+    try:
+        import base64
+        data = base64.b64encode(_LOGO_PATH.read_bytes()).decode("ascii")
+        return f"data:image/png;base64,{data}"
+    except OSError:
+        return ""
+
+
+def _render_ieee_header():
+    """Dark utility bar, the white IEEE Account brand bar, and the breadcrumb.
+
+    Modeled on the ieee.org/ieee-privacyportal header. Per request the header
+    carries no hyperlinks, and the signed-in member is a literal placeholder."""
+    bar = '<span class="ieee-tn-bar">|</span>'
+    left = bar.join(f'<span>{s}</span>' for s in _IEEE_TOPNAV_LEFT)
+    right = bar.join([
+        '<span>Cart (0)</span>',
+        f'<span class="ieee-tn-name">{html.escape(_MEMBER_NAME)}</span>',
+        '<span>Sign Out</span>'])
+    logo = _logo_data_uri()
+    logo_html = (f'<img class="ieee-logo" src="{logo}" alt="IEEE">'
+                 if logo else '<span class="ieee-account">IEEE</span>')
+    crumbs = ["IEEE Account", "Profile", "Communication Preferences",
+              "Local IEEE Communications"]
+    crumb_html = '<span class="ieee-crumb-sep">›</span>'.join(
+        f'<span class="ieee-crumb{" current" if i == len(crumbs) - 1 else ""}">'
+        f'{html.escape(c)}</span>'
+        for i, c in enumerate(crumbs))
+    st.markdown(
+        '<div class="ieee-topnav"><div class="ieee-chrome-inner ieee-tn-inner">'
+        f'<div class="ieee-tn-left">{left}</div>'
+        f'<div class="ieee-tn-right">{right}</div></div></div>'
+        '<div class="ieee-brandbar"><div class="ieee-chrome-inner ieee-brand-inner">'
+        f'<span class="ieee-account">IEEE Account</span>{logo_html}</div></div>'
+        '<div class="ieee-breadcrumb"><div class="ieee-chrome-inner">'
+        f'{crumb_html}</div></div>',
+        unsafe_allow_html=True)
+
+
+def _render_ieee_footer():
+    """The blue IEEE footer (columns, Locations, socials) and the dark legal
+    strip, modeled on the ieee.org/ieee-privacyportal footer."""
+    def _links(items):
+        return "".join(
+            f'<li><a href="{html.escape(href)}" target="_blank">'
+            f'{html.escape(label)}</a></li>' for label, href in items)
+
+    cols = ""
+    for head, blurb, items in _IEEE_FOOTER_COLS:
+        blurb_html = (f'<p class="ieee-fblurb">{html.escape(blurb)}</p>'
+                      if blurb else "")
+        cols += (f'<div class="ieee-fcol"><h4>{html.escape(head)}</h4>'
+                 f'{blurb_html}<ul>{_links(items)}</ul></div>')
+    connect = (
+        '<div class="ieee-fcol"><h4>Connect with IEEE</h4>'
+        '<a class="ieee-contact-btn" href="https://supportcenter.ieee.org" '
+        'target="_blank">Contact &amp; Support</a>'
+        f'<ul>{_links(_IEEE_CONNECT)}</ul></div>')
+    social = "".join(
+        f'<a class="ieee-social" href="{html.escape(url)}" target="_blank" '
+        f'aria-label="{html.escape(name)}"><svg viewBox="0 0 24 24" '
+        f'fill="currentColor">{path}</svg></a>'
+        for name, url, path in _IEEE_SOCIAL)
+    locations = (
+        '<div class="ieee-flocrow"><div class="ieee-floc">'
+        '<h4>Locations</h4><p class="ieee-fblurb">IEEE has a global presence '
+        'with seven offices internationally.</p>'
+        '<ul><li><a href="https://www.ieee.org/about/contact-center.html" '
+        'target="_blank">IEEE office locations</a></li></ul></div>'
+        f'<div class="ieee-fsocials">{social}</div></div>')
+    legal = '<span class="ieee-legal-bar">|</span>'.join(
+        f'<a href="{html.escape(href)}" target="_blank">{html.escape(label)}</a>'
+        for label, href in _IEEE_FOOTER_LEGAL)
+    terms = ('<a href="https://www.ieee.org/about/help/site-terms-conditions.html" '
+             'target="_blank">IEEE Terms and Conditions</a>')
+    st.markdown(
+        '<div class="ieee-footer"><div class="ieee-chrome-inner">'
+        f'<div class="ieee-fcols">{cols}{connect}</div>{locations}'
+        '</div></div>'
+        '<div class="ieee-footer-legal"><div class="ieee-chrome-inner">'
+        f'<div class="ieee-legal-links">{legal}</div>'
+        f'<div class="ieee-copyright">© Copyright {date.today().year} IEEE — '
+        f'All rights reserved. Use of this website signifies your agreement to '
+        f'the {terms}.<br>A not-for-profit organization, IEEE is the world\'s '
+        'largest technical professional organization dedicated to advancing '
+        'technology for the benefit of humanity.</div>'
+        '</div></div>',
+        unsafe_allow_html=True)
+
+
+def render_preferences_view(df, selected_norm, unit_info):
+    """The member-facing preferences center, shown in the main pane with IEEE
+    Account portal chrome. Live: toggling units updates the Expected Emails
+    panel, and choosing Custom reveals per-unit frequency selectors. Saving
+    applies the preferences and returns to the digest."""
+    # View picker sits above the IEEE Account portal header.
+    _render_view_picker(selected_norm)
+    _render_ieee_header()
+
+    saved = _saved_prefs(selected_norm)
+    sig = _pref_sig(selected_norm)
+    p = f"pref::{sig}::"  # common prefix for this selection's widget keys
+    units_sorted = sorted(selected_norm,
+                          key=lambda s: _unit_name(s, unit_info).lower())
+    rates, _months = _monthly_rates(df, selected_norm)
+    seen = _seen_tags(selected_norm)  # {lowercased: display} from the digest
+
+    st.markdown('<div class="pref-page">', unsafe_allow_html=True)
+    st.markdown('<h1 class="pref-h1">Local IEEE Communications</h1>',
+                unsafe_allow_html=True)
+    st.markdown('<p class="pref-intro">Configure your personalized local IEEE '
+                'communications preferences. These choices control which '
+                'eNotices you receive and how they are delivered.</p>',
+                unsafe_allow_html=True)
+
+    left, right = st.columns([3, 2], vertical_alignment="top")
+
+    with left:
+        st.markdown("#### Organizational Units")
+        st.caption("Choose which organizational units' eNotices you want to "
+                   "receive, and how often.")
+        st.caption("**Immediate** sends each eNotice as its own email; "
+                   "**Daily**, **Weekly**, or **Monthly** combine them into a "
+                   "digest.")
+        saved_units = saved.get("units")
+        saved_freqs = saved.get("frequencies", {})
+
+        # Bulk action: apply one delivery frequency to every unit at once
+        # (replaces the old global frequency dropdown + hidden "Custom" mode).
+        def _apply_all_freq():
+            v = st.session_state[p + "setall"]
+            for unit in units_sorted:
+                st.session_state[p + "freq::" + unit] = v
+
+        sa1, sa2 = st.columns([2, 1], vertical_alignment="bottom")
+        sa1.selectbox("Set all units to", _FREQ_OPTIONS, key=p + "setall")
+        sa2.button("Apply to all", on_click=_apply_all_freq,
+                   use_container_width=True, key=p + "applyall")
+
+        # One row per unit: an include checkbox (labelled with the unit name)
+        # and that unit's own delivery frequency. Seeding the frequency in
+        # session_state (rather than via index=) lets "Apply to all" and the
+        # saved-value restore drive the selectbox without Streamlit warnings; an
+        # excluded unit's frequency is disabled.
+        st.markdown('<div class="pref-unit-head"><span>Include</span>'
+                    '<span>Frequency</span></div>', unsafe_allow_html=True)
+        unit_checked, unit_freq = {}, {}
+        for u in units_sorted:
+            fkey = p + "freq::" + u
+            if fkey not in st.session_state:
+                cur = saved_freqs.get(u, "Immediate")
+                st.session_state[fkey] = cur if cur in _FREQ_OPTIONS \
+                    else "Immediate"
+            rc1, rc2 = st.columns([3, 2], vertical_alignment="center")
+            with rc1:
+                default_inc = True if saved_units is None else (u in saved_units)
+                unit_checked[u] = st.checkbox(
+                    _unit_name(u, unit_info), value=default_inc,
+                    key=p + "unit::" + u)
+            with rc2:
+                unit_freq[u] = st.selectbox(
+                    f"Frequency for {_unit_name(u, unit_info)}", _FREQ_OPTIONS,
+                    key=fkey, label_visibility="collapsed",
+                    disabled=not unit_checked[u])
+
+        st.markdown("#### Tags to Exclude")
+        st.caption("eNotices tagged with any of these hashtags won't be sent to "
+                   "you. Tags come from your recent eNotices.")
+        tag_options = sorted(seen.values(), key=str.lower)
+        if tag_options:
+            excl = st.multiselect(
+                "Tags to exclude", options=tag_options,
+                default=[t for t in saved.get("exclude_terms", [])
+                         if t in tag_options],
+                format_func=lambda b: f"#{b}",
+                key=p + "excl", label_visibility="collapsed",
+                placeholder="Choose tags to exclude…")
+        else:
+            excl = []
+            st.info("Tags will appear here once your eNotice Archive has loaded "
+                    "some eNotices — open your archive first, then return here. "
+                    "This is specific to the prototype, where tags are "
+                    "generated on demand as you open the archive. In a "
+                    "production system the tags would already be available, so "
+                    "they'd be listed here right away.")
+
+    with right:
+        included_now = {u: _unit_name(u, unit_info)
+                        for u in units_sorted if unit_checked[u]}
+        st.markdown(_expected_panel_html(rates, included_now),
+                    unsafe_allow_html=True)
+        st.button("View your eNotice Archive", key="prefs_back",
+                  on_click=_go_digest, use_container_width=True)
+
+    st.divider()
+    b1, b2, b3, _ = st.columns([1, 1, 1, 1])
+    save = b1.button("Save Preferences", type="primary",
+                     use_container_width=True, key="prefs_save")
+    cancel = b2.button("Cancel", use_container_width=True, key="prefs_cancel",
+                       help="Discard any changes made since you last saved.")
+    reset = b3.button("Reset to Default", use_container_width=True,
+                      key="prefs_reset")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    _render_ieee_footer()
+
+    if save:
+        prefs = st.session_state.setdefault("saved_prefs", {})
+        prefs[sig] = {
+            "units": {u for u in units_sorted if unit_checked[u]},
+            "frequencies": {u: unit_freq[u] for u in units_sorted},
+            "exclude_terms": list(excl),
+            "exclude_bodies": {b.lower() for b in excl},
+        }
+        st.session_state.view = "digest"
+        st.rerun()
+    if cancel:
+        # Discard unsaved edits: clear this selection's widget state (so the
+        # controls re-seed from the last-saved preferences) but keep the saved
+        # preferences themselves, then return to the Archive.
+        for k in [k for k in st.session_state if k.startswith(p)]:
+            del st.session_state[k]
+        st.session_state.view = "digest"
+        st.rerun()
+    if reset:
+        st.session_state.get("saved_prefs", {}).pop(sig, None)
+        for k in [k for k in st.session_state if k.startswith(p)]:
+            del st.session_state[k]
+        st.rerun()
 
 
 _SEARCH_HELP = (
@@ -1319,8 +1794,18 @@ def _search_records(query, selected_norm):
              "recips": r["recips"]} for r in matched]
 
 
-def _render_tile_page(records, unit_info, scope_note, empty_msg):
-    """Paginate `records`, generate each tile's summary/image/tags, and render."""
+def _render_tile_page(records, unit_info, scope_note, empty_msg,
+                      exclude_bodies=frozenset(), collect_tags=False):
+    """Paginate `records`, generate each tile's summary/image/tags, and render.
+
+    `exclude_bodies` is a set of lower-cased tag bodies (from the preferences
+    center's Tags to Exclude); a tile whose generated tags include any of them
+    is hidden. Because tags are produced per tile as the page is prepared, the
+    exclusion is applied to the current page after generation.
+
+    When `collect_tags` is set, every tag produced on this page is recorded in
+    `st.session_state["seen_tags"]` (before exclusion), so the preferences
+    center can offer exactly the tags present in the member's current digest."""
     total = len(records)
     sig = tuple(r["public_url"] for r in records)
     if st.session_state.get("digest_page_sig") != sig:
@@ -1376,8 +1861,22 @@ def _render_tile_page(records, unit_info, scope_note, empty_msg):
     progress.empty()
     note.empty()
 
+    # Record the tags shown in this digest so the preferences center can offer
+    # exactly the tags present in the member's current digest (before exclusion).
+    if collect_tags:
+        seen = st.session_state.setdefault("seen_tags", {})
+        for _summary, _img, tags in results:
+            for body, _src in (tags or []):
+                if body:
+                    seen[body.lower()] = body
+
     blocks = []
+    excluded = 0
     for rec, (summary, img, tags) in zip(tiles, results):
+        if exclude_bodies and tags and any(
+                body.lower() in exclude_bodies for body, _src in tags):
+            excluded += 1
+            continue
         units_html = _join_units(rec["recips"], unit_info) or "—"
         sent = rec["sent_dt"]
         sent_txt = f"Sent {_fmt_date(sent)}" if pd.notna(sent) else ""
@@ -1402,6 +1901,13 @@ def _render_tile_page(records, unit_info, scope_note, empty_msg):
             f'<div class="digest-tags">{tags_html}</div>'
             '</div></div>')
     st.markdown("\n".join(blocks), unsafe_allow_html=True)
+    if excluded:
+        msg = (f"{excluded} eNotice(s) on this page were hidden by your "
+               "excluded tags.")
+        if not blocks:
+            msg += (" Use the Newer/Older controls to see others, or adjust "
+                    "your excluded tags under “Manage your digest settings.”")
+        st.caption(msg)
 
     # Pager: Newer / Older with a position indicator, when there's >1 page.
     if total > _DIGEST_MAX_TILES:
@@ -1422,19 +1928,32 @@ def _render_tile_page(records, unit_info, scope_note, empty_msg):
                 unsafe_allow_html=True)
 
 
-def render_digest_view(digest, selected_norm, unit_info, end_date):
-    """Render the tiled digest, with a search box over the selected units."""
-    c_logo, c_title, c_link = st.columns([2, 6, 2],
-                                         vertical_alignment="center")
+def render_digest_view(df, digest, selected_norm, unit_info, end_date):
+    """Render the tiled digest, with a search box over the selected units.
+
+    Saved preferences (from the "Manage your digest settings" page) narrow the
+    view: only the units the member left checked contribute eNotices, and tiles
+    whose tags match an excluded tag are hidden. `df` is the whole (sent) data
+    file, used by the preferences page to estimate emails/month per unit."""
+    _seen_tags(selected_norm)  # ensure the seen-tags store matches this selection
+    saved = _saved_prefs(selected_norm)
+    included = saved.get("units")  # None => no saved prefs yet (all included)
+    effective_norm = (selected_norm if included is None
+                      else {s for s in selected_norm if s in included})
+    exclude_bodies = saved.get("exclude_bodies", frozenset())
+    if included is not None:
+        digest = digest[digest["recipient_SPOIDs"].apply(
+            lambda c: matches_recipients(c, effective_norm))]
+
+    _render_view_picker(selected_norm)
+
+    c_logo, c_title = st.columns([2, 8], vertical_alignment="center")
     with c_logo:
         if _LOGO_PATH.exists():
             st.image(str(_LOGO_PATH), width=150)
     with c_title:
-        st.markdown('<div class="digest-title">Your IEEE eNotice Digest</div>',
+        st.markdown('<div class="digest-title">Your IEEE eNotice Archive</div>',
                     unsafe_allow_html=True)
-    with c_link:
-        st.button("Table view (internal)", key="to_archive",
-                  on_click=_go_archive)
 
     date_txt = _fmt_full_date(end_date) if end_date is not None else ""
     st.markdown('<hr class="digest-rule">'
@@ -1453,7 +1972,7 @@ def render_digest_view(digest, selected_norm, unit_info, end_date):
             st.markdown(_SEARCH_HELP)
 
     if query:
-        records = _search_records(query, selected_norm)
+        records = _search_records(query, effective_norm)
         st.caption(f"{len(records)} recent eNotice(s) matching your search.")
         scope_note = (
             "In this prototype, search scans your selected units' recent "
@@ -1463,7 +1982,8 @@ def render_digest_view(digest, selected_norm, unit_info, end_date):
         empty_msg = ("No recent eNotices from your selected units match your "
                      "search. Try different or fewer terms, or clear the search "
                      "box to return to the digest.")
-        _render_tile_page(records, unit_info, scope_note, empty_msg)
+        _render_tile_page(records, unit_info, scope_note, empty_msg,
+                          exclude_bodies)
     else:
         scope_note = (
             "This prototype shows the eNotices sent to your selected units "
@@ -1471,18 +1991,103 @@ def render_digest_view(digest, selected_norm, unit_info, end_date):
             f"file -- most recent first, {_DIGEST_MAX_TILES} at a time. Use the "
             "Newer/Older controls to move through them.")
         empty_msg = ("No eNotices to display for the selected units within the "
-                     "sidebar date range. Widen the date range or adjust your "
-                     "selection in the sidebar.")
-        _render_tile_page(_csv_records(digest, selected_norm), unit_info,
-                          scope_note, empty_msg)
+                     "sidebar date range. Widen the date range, adjust your "
+                     "selection in the sidebar, or check your included "
+                     "Organizational Units under “Manage your digest settings.”")
+        _render_tile_page(_csv_records(digest, effective_norm), unit_info,
+                          scope_note, empty_msg, exclude_bodies,
+                          collect_tags=True)
 
-    agg = _join_units(selected_norm, unit_info)
-    st.markdown(f'<div class="digest-agg">This digest aggregates content from '
-                f'{agg}.</div>', unsafe_allow_html=True)
-    if st.button("Manage your digest settings.", key="manage_settings"):
-        _settings_dialog()
+    agg = _join_units(effective_norm, unit_info)
+    if agg:
+        st.markdown('<div class="digest-agg">This archive includes eNotices '
+                    f'from {agg}.</div>', unsafe_allow_html=True)
+    st.button("Manage your preferences", key="manage_prefs", on_click=_go_prefs)
     st.markdown(f'<div class="digest-copyright">© {date.today().year} IEEE. '
                 'All rights reserved.</div>', unsafe_allow_html=True)
+
+
+def render_digest_freq_view(freq, digest, selected_norm, unit_info):
+    """Render the Daily/Weekly/Monthly digest: the most recent non-empty period
+    (within the sidebar date range) for the units the member set to `freq`, as
+    tiles with the same format and pagination as the eNotice Archive.
+
+    `freq` is a stored frequency label ("Daily Digest" / "Weekly Digest" /
+    "Monthly Digest"). Only the units assigned that frequency contribute, and
+    the excluded-tag filter applies exactly as on the Archive."""
+    _render_view_picker(selected_norm)
+
+    units_f = _active_digest_freqs(selected_norm).get(freq, set())
+    exclude_bodies = _saved_prefs(selected_norm).get("exclude_bodies",
+                                                     frozenset())
+    period_word = {"Daily Digest": "day", "Weekly Digest": "week",
+                   "Monthly Digest": "month"}[freq]
+
+    def _freq_footer():
+        """The 'Manage your preferences' link + copyright, shown on every path."""
+        st.button("Manage your preferences", key="manage_prefs_freq",
+                  on_click=_go_prefs)
+        st.markdown(f'<div class="digest-copyright">© {date.today().year} IEEE. '
+                    'All rights reserved.</div>', unsafe_allow_html=True)
+
+    c_logo, c_title = st.columns([2, 8], vertical_alignment="center")
+    with c_logo:
+        if _LOGO_PATH.exists():
+            st.image(str(_LOGO_PATH), width=150)
+    with c_title:
+        st.markdown(f'<div class="digest-title">Your {freq}</div>',
+                    unsafe_allow_html=True)
+
+    # Restrict the (already date-ranged) set to this frequency's units.
+    sub = digest[digest["recipient_SPOIDs"].apply(
+        lambda c: matches_recipients(c, units_f))]
+    if sub.empty or sub["_sent_dt"].dropna().empty:
+        st.markdown('<hr class="digest-rule">', unsafe_allow_html=True)
+        st.info(f"No eNotices for your {freq.lower()} units within the sidebar "
+                "date range. Widen the date range in the sidebar, or adjust "
+                "delivery frequencies in the Preferences Center.")
+        _freq_footer()
+        return
+
+    # Find the most recent non-empty period and its rows + a display label.
+    dts = sub["_sent_dt"]
+    if freq == "Daily Digest":
+        day = dts.dropna().dt.normalize().max()
+        period_rows = sub[dts.dt.normalize() == day]
+        period_label = _fmt_full_date(day)
+    elif freq == "Weekly Digest":
+        week_start = (dts - pd.to_timedelta(dts.dt.weekday, unit="D")).dt.normalize()
+        start = week_start.dropna().max()
+        period_rows = sub[week_start == start]
+        end = start + pd.Timedelta(days=6)
+        period_label = f"the week of {_fmt_date(start)} – {_fmt_date(end)}"
+    else:  # Monthly Digest
+        month = dts.dt.to_period("M")
+        target = month.dropna().max()
+        period_rows = sub[month == target]
+        period_label = target.strftime("%B %Y")
+
+    st.markdown('<hr class="digest-rule">'
+                f'<div class="digest-date">{html.escape(period_label)}</div>',
+                unsafe_allow_html=True)
+
+    scope_note = (
+        f"This prototype shows what your {freq.lower()} would have contained "
+        f"for {period_label} — the most recent {period_word} with eNotices for "
+        f"the units you set to “{freq}”, within the sidebar date range. Tiles "
+        f"appear {_DIGEST_MAX_TILES} at a time; use the Newer/Older controls to "
+        "move through them.")
+    empty_msg = (f"Every eNotice in this {period_word} was hidden by your "
+                 "excluded tags. Adjust your excluded tags in the Preferences "
+                 "Center.")
+    _render_tile_page(_csv_records(period_rows, units_f), unit_info,
+                      scope_note, empty_msg, exclude_bodies)
+
+    agg = _join_units(units_f, unit_info)
+    if agg:
+        st.markdown(f'<div class="digest-agg">This {freq.lower()} covers '
+                    f'eNotices from {agg}.</div>', unsafe_allow_html=True)
+    _freq_footer()
 
 
 # --------------------------------------------------------------------------- #
@@ -1503,7 +2108,7 @@ st.markdown(
     /* Related-units picker: let each selected-unit chip grow to fit its full
        name (no ellipsis) and use a calm teal instead of the default red. */
     span[data-baseweb="tag"] {
-        background-color: #3f7d8c !important;
+        background-color: #007377 !important;
         color: #ffffff !important;
         max-width: none !important;
         height: auto !important;
@@ -1528,7 +2133,7 @@ st.markdown(
                     border-radius: 4px; display: flex; align-items: center;
                     justify-content: center; font-size: 2.2rem; color: #9bb0c1;
                     overflow: hidden;
-                    background: linear-gradient(135deg, #eef3f7, #d9e2ea); }
+                    background: linear-gradient(135deg, #EAF1F6, #C7D6E4); }
     .digest-thumb img { width: 100%; height: 100%; object-fit: cover;
                         display: block; }
     .digest-body { flex: 1; min-width: 0; }
@@ -1542,7 +2147,7 @@ st.markdown(
                       font-weight: 600; margin-bottom: 0.4rem; }
     .digest-summary { color: #333; font-size: 0.95rem; line-height: 1.45;
                       margin-bottom: 0.55rem; }
-    .digest-tag { display: inline-block; background: #eaf1f8; color: #00629B;
+    .digest-tag { display: inline-block; background: #E7EEF4; color: #00629B;
                   font-size: 0.8rem; padding: 0.1rem 0.55rem; border-radius: 12px;
                   margin: 0 0.35rem 0.25rem 0; cursor: help; }
     .digest-page { text-align: center; color: #444; font-size: 0.9rem; }
@@ -1552,18 +2157,96 @@ st.markdown(
                   font-size: 1rem; }
     .digest-copyright { text-align: center; color: #777; font-size: 1rem;
                         margin-top: 0.3rem; }
-    /* Buttons styled as inline text links (view switch + manage settings). */
-    .st-key-to_archive button, .st-key-to_digest button,
-    .st-key-manage_settings button {
+    /* "Manage your preferences" rendered as a centered inline text link. */
+    .st-key-manage_prefs button, .st-key-manage_prefs_freq button {
         color: #00629B !important; background: transparent !important;
         border: none !important; box-shadow: none !important;
-        padding: 0 !important; min-height: 0 !important; font-weight: 400;
-    }
-    .st-key-to_archive button:hover, .st-key-to_digest button:hover,
-    .st-key-manage_settings button:hover { text-decoration: underline; }
-    .st-key-manage_settings { width: 100% !important; display: flex;
-        justify-content: center; }
-    .st-key-manage_settings button { font-size: 1rem !important; }
+        padding: 0 !important; min-height: 0 !important; font-weight: 400; }
+    .st-key-manage_prefs button:hover,
+    .st-key-manage_prefs_freq button:hover { text-decoration: underline; }
+    .st-key-manage_prefs, .st-key-manage_prefs_freq {
+        width: 100% !important; display: flex; justify-content: center; }
+    /* --- Preferences center (Manage your digest settings) --- */
+    .pref-panel { background: #EAF1F6; border: 1px solid #BAC6D9;
+                  border-radius: 8px; padding: 1rem 1.1rem; }
+    .pref-panel-title { font-size: 1.1rem; font-weight: 600; color: #00629B; }
+    .pref-total { font-size: 2.6rem; font-weight: 700; color: #1a1a1a;
+                  line-height: 1.1; margin: 0.2rem 0; }
+    .pref-sub { color: #667; font-size: 0.82rem; }
+    .pref-breakdown-title { font-weight: 600; color: #1a1a1a;
+                            margin: 0.9rem 0 0.4rem; font-size: 0.92rem;
+                            border-top: 1px solid #BAC6D9; padding-top: 0.7rem; }
+    .pref-row { display: flex; justify-content: space-between; gap: 0.5rem;
+                align-items: baseline; padding: 0.2rem 0; font-size: 0.9rem; }
+    .pref-name { color: #333; }
+    .pref-count { font-weight: 700; color: #00629B; min-width: 2rem;
+                  text-align: right; }
+    .pref-unit-head { display: flex; font-size: 0.72rem; font-weight: 700;
+                      color: #8a8a8a; text-transform: uppercase;
+                      letter-spacing: 0.04em; margin: 0.5rem 0 0.1rem; }
+    .pref-unit-head span:first-child { flex: 3; }
+    .pref-unit-head span:last-child { flex: 2; }
+    /* --- IEEE Account portal chrome (member-facing preferences page) --- */
+    .ieee-chrome-inner { max-width: 1120px; margin: 0 auto; }
+    .ieee-topnav { background: #1a1a1a; color: #f2f2f2; font-size: 0.8rem;
+                   padding: 0.55rem 1rem; }
+    .ieee-tn-inner { display: flex; justify-content: space-between;
+                     flex-wrap: wrap; gap: 0.4rem 1rem; }
+    .ieee-tn-left, .ieee-tn-right { display: flex; align-items: center;
+                                    flex-wrap: wrap; }
+    .ieee-topnav em { font-style: italic; }
+    .ieee-tn-name { font-weight: 700; color: #ffffff; }
+    .ieee-tn-bar { color: #5a5a5a; margin: 0 0.55rem; }
+    .ieee-home { color: #f2f2f2; }
+    .ieee-brandbar { background: #ffffff; padding: 1.1rem 1rem 0.9rem; }
+    .ieee-brand-inner { display: flex; justify-content: space-between;
+                        align-items: center; }
+    .ieee-account { color: #00629B; font-size: 2rem; font-weight: 700;
+                    line-height: 1; }
+    .ieee-logo { height: 38px; width: auto; }
+    .ieee-breadcrumb { background: #f2f2f2; border-top: 1px solid #e2e2e2;
+                       padding: 0.65rem 1rem; font-size: 0.95rem; }
+    .ieee-crumb { color: #981D97; }
+    .ieee-crumb.current { text-decoration: underline; }
+    .ieee-crumb-sep { color: #999; margin: 0 0.55rem; }
+    .ieee-footer { background: #00629B; color: #ffffff;
+                   padding: 2.2rem 1rem 1.6rem; margin-top: 1.5rem; }
+    .ieee-fcols { display: flex; flex-wrap: wrap; gap: 1.5rem; }
+    .ieee-fcol { flex: 1 1 170px; min-width: 140px; }
+    .ieee-fcol h4 { color: #fff; font-size: 1rem; font-weight: 700;
+                    margin: 0 0 0.7rem; }
+    .ieee-fblurb { color: #e6eef4; font-size: 0.82rem; line-height: 1.45;
+                   margin: 0 0 0.7rem; }
+    .ieee-fcol ul { list-style: none; padding: 0; margin: 0; }
+    .ieee-fcol li { margin: 0.3rem 0; }
+    .ieee-fcol li a { color: #fff; text-decoration: none; font-size: 0.85rem; }
+    .ieee-fcol li a::before { content: "› "; color: #BAC6D9; }
+    .ieee-fcol li a:hover { text-decoration: underline; }
+    .ieee-contact-btn { display: inline-block; border: 1px solid #fff;
+                        padding: 0.5rem 1.1rem; font-weight: 700;
+                        font-size: 0.85rem; margin-bottom: 0.9rem; color: #fff;
+                        text-decoration: none; }
+    .ieee-contact-btn:hover { background: #fff; color: #00629B; }
+    .ieee-flocrow { display: flex; justify-content: space-between;
+                    align-items: flex-end; flex-wrap: wrap; gap: 1rem;
+                    margin-top: 1.6rem; }
+    .ieee-floc { flex: 1 1 260px; }
+    .ieee-fsocials { display: flex; gap: 0.9rem; align-items: center; }
+    .ieee-social { color: #fff; display: inline-flex; }
+    .ieee-social svg { width: 20px; height: 20px; display: block; }
+    .ieee-social:hover { color: #BAC6D9; }
+    .ieee-footer-legal { background: #1a1a1a; padding: 1.1rem 1rem;
+                         font-size: 0.8rem; }
+    .ieee-legal-links { margin-bottom: 0.55rem; line-height: 1.9; }
+    .ieee-footer-legal a { color: #FFC72C; text-decoration: none; }
+    .ieee-footer-legal a:hover { text-decoration: underline; }
+    .ieee-legal-bar { color: #5a5a5a; margin: 0 0.55rem; }
+    .ieee-copyright { color: #B7B8BA; line-height: 1.55; }
+    .ieee-copyright a { color: #FFC72C; text-decoration: underline; }
+    /* Preferences page body (between the IEEE header and footer). */
+    .pref-h1 { color: #00629B; font-size: 1.7rem; font-weight: 700;
+               margin: 1rem 0 0.25rem; }
+    .pref-intro { color: #444; font-size: 0.97rem; margin: 0 0 0.4rem; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -1590,10 +2273,26 @@ with st.sidebar:
     selected = []
     section_ou = None
     if section_spoid:
-        with st.spinner("Finding related units..."):
-            related = related_units(section_spoid)
-            pool = recipient_pool(section_spoid, data_file)
-            chapters_by_soc, sbc_links = society_links(section_spoid)
+        # Walk the OU graph once per Section (memoized in session_state), showing
+        # a progress bar only on that first walk. Pool and Society mappings are
+        # derived from that single result -- no repeat walks.
+        rel_key = "related::" + str(section_spoid)
+        if rel_key not in st.session_state:
+            _prog = st.progress(0.0, text="Finding related units…")
+
+            def _rel_progress(n):
+                # Total is unknown during the walk, so ease toward 0.9 as units
+                # are found (never a false 100%).
+                frac = min(0.9, 1.0 - 1.0 / (1.0 + n / 20.0))
+                _prog.progress(frac, text=f"Finding related units… ({n} found)")
+
+            st.session_state[rel_key] = related_units(
+                section_spoid, progress=_rel_progress)
+            _prog.progress(1.0, text="Done")
+            _prog.empty()
+        related = st.session_state[rel_key]
+        pool = recipient_pool(related, data_file)
+        chapters_by_soc, sbc_links = society_links(related)
         section_ou = related.get(resolve_spoid(section_spoid)) or \
             related.get(section_spoid)
         root_spoid = section_ou.spoid if section_ou else section_spoid
@@ -1796,14 +2495,25 @@ digest = df[mask]
 unit_info = {resolve_spoid(sp): ou for sp, ou in label_pool.items()}
 
 st.session_state.setdefault("view", "digest")
+# Fall back to the Archive if the member is on a digest view whose frequency is
+# no longer assigned to any included unit (e.g. after editing preferences).
+if st.session_state.view in _VIEW_FREQ and \
+        _VIEW_FREQ[st.session_state.view] not in _active_digest_freqs(selected_norm):
+    st.session_state.view = "digest"
+
+if st.session_state.view == "preferences":
+    render_preferences_view(df, selected_norm, unit_info)
+    st.stop()
 if st.session_state.view == "digest":
-    render_digest_view(digest, selected_norm, unit_info, end_date)
+    render_digest_view(df, digest, selected_norm, unit_info, end_date)
+    st.stop()
+if st.session_state.view in _VIEW_FREQ:
+    render_digest_freq_view(_VIEW_FREQ[st.session_state.view],
+                            digest, selected_norm, unit_info)
     st.stop()
 
-# --- Archive view ---
-_archive_cols = st.columns([8, 2])
-with _archive_cols[1]:
-    st.button("← Digest", key="to_digest", on_click=_go_digest)
+# --- Table view (internal) ---
+_render_view_picker(selected_norm)
 
 # Drop the excluded statistic columns, the status column, and hidden helpers.
 drop_cols = [c for c in _STAT_COLUMNS + _HIDDEN_COLUMNS if c in digest.columns]

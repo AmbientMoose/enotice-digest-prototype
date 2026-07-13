@@ -1,0 +1,6 @@
+# IEEE-branded theme. Colors are from the official IEEE color palette
+# (brand-experience.ieee.org color guide): primary/link = IEEE Blue #00629B.
+# Backgrounds and text are left as neutral white/near-black defaults.
+[theme]
+primaryColor = "#00629B"
+linkColor = "#00629B"
