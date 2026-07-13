@@ -1946,14 +1946,14 @@ def render_digest_view(df, digest, selected_norm, unit_info, end_date):
     with c_q:
         query = st.text_input(
             "Search eNotices", key="digest_search",
-            placeholder="Search your digest's eNotices by full-text content…",
+            placeholder="Search your archive's eNotices by full-text content…",
             label_visibility="collapsed").strip()
     with c_i:
         with st.popover("ℹ️"):
             st.markdown(_SEARCH_HELP)
 
     if query:
-        records = _search_records(query, effective_norm)
+        records = _search_records(digest, effective_norm, query)
         st.caption(f"{len(records)} recent eNotice(s) matching your search.")
         scope_note = (
             "In this prototype, search scans the full text of the "
