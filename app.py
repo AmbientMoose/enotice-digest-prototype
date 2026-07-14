@@ -1288,7 +1288,8 @@ def _digest_next():
 # --------------------------------------------------------------------------- #
 # Preferences center (member-facing "Manage your digest settings" page)
 
-_FREQ_OPTIONS = ["Immediate", "Daily Digest", "Weekly Digest", "Monthly Digest"]
+_FREQ_OPTIONS = ["Immediate", "Daily Digest", "Weekly Digest", "Monthly Digest",
+                 "Archive Only"]
 
 
 def _pref_sig(selected_norm):
@@ -1591,7 +1592,9 @@ def render_preferences_view(df, selected_norm, unit_info):
                    "receive, and how often.")
         st.caption("**Immediate** sends each eNotice as its own email; "
                    "**Daily**, **Weekly**, or **Monthly** combine them into a "
-                   "digest.")
+                   "digest. **Archive Only** keeps a unit's eNotices in your "
+                   "archive without sending them at all — no individual emails "
+                   "and no digest.")
         saved_units = saved.get("units")
         saved_freqs = saved.get("frequencies", {})
 
@@ -1687,8 +1690,10 @@ def render_preferences_view(df, selected_norm, unit_info):
                     "they'd be listed here right away.")
 
     with right:
-        included_now = {u: _unit_name(u, unit_info)
-                        for u in units_sorted if unit_checked[u]}
+        # Archive-Only units are never emailed, so they don't count toward the
+        # Expected Emails estimate (updates live as a unit's frequency changes).
+        included_now = {u: _unit_name(u, unit_info) for u in units_sorted
+                        if unit_checked[u] and unit_freq[u] != "Archive Only"}
         st.markdown(_expected_panel_html(rates, included_now),
                     unsafe_allow_html=True)
         st.button("View your eNotice Archive", key="prefs_back",
